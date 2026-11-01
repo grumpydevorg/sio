@@ -328,27 +328,10 @@ fn run_terminal(connection: &ConnectionArgs, crlf: bool) -> Result<()> {
 
 fn terminal_loop(transport: &mut dyn SerialTransport, crlf: bool) -> Result<()> {
     let mut stdout = io::stdout().lock();
-    let mut received = Vec::with_capacity(4096);
-    let mut display = Vec::with_capacity(8192);
+    let mut screen = Screen::new(crlf);
     let mut keys = Vec::with_capacity(16);
     loop {
-        received.clear();
-        transport.read_into(&mut received, 4096, TERMINAL_POLL)?;
-        if !received.is_empty() {
-            if crlf {
-                display.clear();
-                for &byte in &received {
-                    if byte == b'\n' {
-                        display.push(b'\r');
-                    }
-                    display.push(byte);
-                }
-                stdout.write_all(&display)?;
-            } else {
-                stdout.write_all(&received)?;
-            }
-            stdout.flush()?;
-        }
+        screen.pump(transport, &mut stdout)?;
         while event::poll(Duration::ZERO)? {
             if let Event::Key(key) = event::read()? {
                 keys.clear();
@@ -360,6 +343,47 @@ fn terminal_loop(transport: &mut dyn SerialTransport, crlf: bool) -> Result<()> 
                 }
             }
         }
+    }
+}
+
+/// Copies device bytes to the screen.
+struct Screen {
+    received: Vec<u8>,
+    mapped: Vec<u8>,
+    crlf: bool,
+}
+
+impl Screen {
+    fn new(crlf: bool) -> Self {
+        Self {
+            received: Vec::with_capacity(4096),
+            mapped: Vec::with_capacity(8192),
+            crlf,
+        }
+    }
+
+    /// Read once and show every byte the transport appended, including bytes
+    /// that arrived before the read failed, then report the failure.
+    fn pump(&mut self, transport: &mut dyn SerialTransport, out: &mut impl Write) -> Result<()> {
+        self.received.clear();
+        let read = transport.read_into(&mut self.received, 4096, TERMINAL_POLL);
+        if !self.received.is_empty() {
+            if self.crlf {
+                self.mapped.clear();
+                for &byte in &self.received {
+                    if byte == b'\n' {
+                        self.mapped.push(b'\r');
+                    }
+                    self.mapped.push(byte);
+                }
+                out.write_all(&self.mapped)?;
+            } else {
+                out.write_all(&self.received)?;
+            }
+            out.flush()?;
+        }
+        read?;
+        Ok(())
     }
 }
 
@@ -505,6 +529,7 @@ fn write_skill(path: &Path, force: bool) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sio::transport::TransportError;
 
     #[test]
     fn limited_reader_discards_an_oversized_line() {
@@ -556,5 +581,55 @@ mod tests {
             key_bytes(KeyCode::Char('x'), KeyModifiers::ALT),
             Some(b"\x1bx".to_vec())
         );
+    }
+
+    /// Delivers its bytes and then reports that the device disconnected, as
+    /// `LocalTransport` does when a hang-up follows data within one read.
+    struct DisconnectAfter(&'static [u8]);
+
+    impl SerialTransport for DisconnectAfter {
+        fn open(&mut self, _: &sio::transport::PortConfig) -> Result<(), TransportError> {
+            Err(TransportError::AlreadyOpen)
+        }
+        fn close(&mut self) -> Result<(), TransportError> {
+            Err(TransportError::NotOpen)
+        }
+        fn write(&mut self, _: &[u8]) -> Result<(), TransportError> {
+            Err(TransportError::NotOpen)
+        }
+        fn read_into(
+            &mut self,
+            buf: &mut Vec<u8>,
+            _: usize,
+            _: Duration,
+        ) -> Result<(), TransportError> {
+            buf.extend_from_slice(self.0);
+            Err(TransportError::Disconnected)
+        }
+        fn modem_control(
+            &mut self,
+            _: Option<bool>,
+            _: Option<bool>,
+        ) -> Result<sio::transport::ModemStatus, TransportError> {
+            Err(TransportError::NotOpen)
+        }
+        fn send_break(&mut self, _: Duration) -> Result<(), TransportError> {
+            Err(TransportError::NotOpen)
+        }
+    }
+
+    #[test]
+    fn terminal_shows_bytes_received_before_a_disconnect() {
+        for (crlf, shown) in [(false, &b"last\nwords"[..]), (true, b"last\r\nwords")] {
+            let mut out = Vec::new();
+            let error = Screen::new(crlf)
+                .pump(&mut DisconnectAfter(b"last\nwords"), &mut out)
+                .expect_err("the disconnect must still be reported");
+            assert_eq!(out, shown);
+            assert!(matches!(
+                error.downcast_ref(),
+                Some(TransportError::Disconnected)
+            ));
+        }
     }
 }
