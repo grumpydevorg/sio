@@ -132,10 +132,11 @@ short waits (2–5 s) in a loop over one long wait. To stop a running `read`,
 - `{"cmd":"cancel"}` without `target` stops whatever wait is running. Use it
   only when you are the session's sole caller; with another caller it can
   stop their request.
-- Reply order: a cancel that stopped a wait replies right after that wait's
-  `cancelled` reply. A cancel that missed replies immediately, ahead of the
-  running and queued requests' replies. Every other reply comes in request
-  order, so match replies by `id`.
+- Reply order: a cancel that stopped a wait replies after that wait's
+  `cancelled` reply, in normal request order, so requests queued before the
+  cancel reply first and can delay it. A cancel that missed replies
+  immediately, ahead of the running and queued requests' replies. Every other
+  reply comes in request order, so match replies by `id`.
 
 Limits: request line 8 MiB; payload, read, and expect window 1 MiB; timeouts
 1–60000 ms; break 1–10000 ms; error messages 512 bytes (longer ones end in
