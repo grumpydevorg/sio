@@ -5,6 +5,7 @@ edition = "2024"
 rust-version = "1.98.0"
 description = "Safe, agent-friendly serial I/O for terminals and automation"
 license = "MIT OR Apache-2.0"
+repository = "https://github.com/grumpydevorg/sio"
 authors = ["Supersensory Technologies <dev@supersensory.ai>"]
 publish = false
 

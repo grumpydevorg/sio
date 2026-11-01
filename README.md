@@ -110,3 +110,7 @@ The crate, executable, package, and project are all named `sio`.
 - Reads consume bytes from the serial stream. A timeout is an ordinary result,
   not permission to retry a write.
 - No command binds a TCP or HTTP socket.
+
+## License
+
+MIT or Apache-2.0, at your option.
