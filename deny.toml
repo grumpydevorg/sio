@@ -1,0 +1,33 @@
+# Supply-chain policy. Run: cargo deny check
+[graph]
+all-features = true
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "MIT",
+    # serialport; file-level copyleft that applies only to modified serialport sources.
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Unlicense",
+]
+
+[licenses.private]
+ignore = true
+
+# serialport's Linux dependency declares the non-SPDX "GPL-3.0/MIT"; sio takes it under MIT.
+[[licenses.clarify]]
+crate = "unescaper"
+expression = "GPL-3.0-only OR MIT"
+license-files = []
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

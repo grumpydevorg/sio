@@ -1,19 +1,23 @@
 //! `sio` command-line interface.
 
 use anyhow::{Context, Result, bail};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::{Args, Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use sio::protocol::{Command, CommandError, LineState, MAX_LINE_BYTES, Parity, Response};
-use sio::server::{CommandHandler, discover_ports, resolve_port, validated_config};
-use sio::transport::{LocalTransport, LoopbackTransport, SerialTransport};
+use sio::protocol::{
+    Command, CommandError, End, MAX_LINE_BYTES, OpenParams, Outcome, Payload, ReadSize, Rejected,
+    Request, Response, TimeoutMs, parse_request,
+};
+use sio::server::CommandHandler;
+use sio::transport::{LocalTransport, LoopbackTransport, SerialTransport, list_ports};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const EMBEDDED_SKILL: &str = include_str!("../skills/sio/SKILL.md");
+
+/// How long the terminal waits for device bytes before checking the keyboard.
+const TERMINAL_POLL: Duration = Duration::from_millis(10);
 
 #[derive(Parser)]
 #[command(
@@ -36,7 +40,7 @@ struct Cli {
 enum Commands {
     /// List available serial ports.
     List {
-        /// Emit a versioned JSON response.
+        /// Emit one versioned JSON response.
         #[arg(long)]
         json: bool,
     },
@@ -44,22 +48,25 @@ enum Commands {
     Terminal {
         #[command(flatten)]
         connection: ConnectionArgs,
+        /// Display each received LF as CR LF, for devices that send bare LF.
+        #[arg(long)]
+        crlf: bool,
     },
     /// Write once and optionally read or expect a response.
     Transact {
         #[command(flatten)]
         connection: ConnectionArgs,
         #[command(flatten)]
-        payload: PayloadArgs,
+        payload: Payload,
         /// Wait for a byte-oriented regular expression.
         #[arg(long, conflicts_with = "bytes")]
         expect: Option<String>,
         /// Read at most this many bytes after writing.
         #[arg(long, value_name = "COUNT")]
-        bytes: Option<usize>,
-        /// Overall read or expect timeout.
+        bytes: Option<ReadSize>,
+        /// Read or expect timeout, 1-60000 ms.
         #[arg(long, default_value = "5000")]
-        timeout_ms: u64,
+        timeout_ms: TimeoutMs,
         /// Emit the final versioned JSON response.
         #[arg(long)]
         json: bool,
@@ -91,56 +98,20 @@ enum Commands {
     },
 }
 
-#[derive(Args, Clone)]
+#[derive(Args)]
 struct ConnectionArgs {
-    /// Serial device path.
-    #[arg(long, value_name = "PATH", conflicts_with = "serial")]
-    port: Option<String>,
-    /// Exact USB serial number; resolves to one preferred device path.
-    #[arg(long, value_name = "SERIAL", conflicts_with = "port")]
-    serial: Option<String>,
-    /// Baud rate.
-    #[arg(short, long, default_value = "115200")]
-    baud: u32,
-    /// Data bits: 5, 6, 7, or 8.
-    #[arg(long, default_value = "8")]
-    bits: u8,
-    /// Parity.
-    #[arg(long, value_enum, default_value = "none")]
-    parity: Parity,
-    /// Stop bits: 1 or 2.
-    #[arg(long, default_value = "1")]
-    stop: u8,
-    /// DTR behavior while opening the port.
-    #[arg(long, value_enum, default_value = "preserve")]
-    dtr: LineState,
-    /// RTS state immediately after opening the port.
-    #[arg(long, value_enum, default_value = "preserve")]
-    rts: LineState,
+    #[command(flatten)]
+    open: OpenParams,
     /// Use an in-memory echo device instead of hardware.
     #[arg(long)]
     loopback: bool,
 }
 
-#[derive(Args)]
-#[group(required = true, multiple = false)]
-struct PayloadArgs {
-    /// Text payload with \n, \r, \t, \\, and \xHH escapes.
-    #[arg(long)]
-    text: Option<String>,
-    /// Hexadecimal byte payload; ASCII whitespace is ignored.
-    #[arg(long)]
-    hex: Option<String>,
-    /// Base64-encoded byte payload.
-    #[arg(long, value_name = "BASE64")]
-    data_b64: Option<String>,
-}
-
 fn main() -> Result<()> {
     match Cli::parse().command {
-        None | Some(Commands::List { json: false }) => run_list(false),
-        Some(Commands::List { json: true }) => run_list(true),
-        Some(Commands::Terminal { connection }) => run_terminal(&connection),
+        None => run_list(false),
+        Some(Commands::List { json }) => run_list(json),
+        Some(Commands::Terminal { connection, crlf }) => run_terminal(&connection, crlf),
         Some(Commands::Transact {
             connection,
             payload,
@@ -148,7 +119,7 @@ fn main() -> Result<()> {
             bytes,
             timeout_ms,
             json,
-        }) => run_transact(&connection, payload, expect, bytes, timeout_ms, json),
+        }) => run_transact(connection, payload, expect, bytes, timeout_ms, json),
         Some(Commands::Stdio {
             loopback,
             read_only,
@@ -162,30 +133,41 @@ fn main() -> Result<()> {
     }
 }
 
+fn transport(loopback: bool) -> Box<dyn SerialTransport> {
+    if loopback {
+        Box::new(LoopbackTransport::new())
+    } else {
+        Box::new(LocalTransport::new())
+    }
+}
+
+const fn request(command: Command) -> Request {
+    Request { id: None, command }
+}
+
 fn run_list(json_output: bool) -> Result<()> {
     if json_output {
-        let mut handler = CommandHandler::new(Box::new(LocalTransport::new()), true);
-        let response = handler.execute(Command::List);
-        println!("{}", serde_json::to_string_pretty(&response)?);
-        if !response.ok {
-            bail!(response_message(&response));
+        let mut handler = CommandHandler::new(transport(false), true);
+        let response = handler.execute(request(Command::List {}));
+        println!("{}", serde_json::to_string(&response)?);
+        if let Err(error) = &response.outcome {
+            bail!("{error}");
         }
         return Ok(());
     }
 
-    let ports = discover_ports()?;
+    let ports = list_ports()?;
     if ports.is_empty() {
         println!("No serial ports found");
-        return Ok(());
     }
     for port in ports {
         let description = port
             .product
             .as_deref()
             .or(port.manufacturer.as_deref())
-            .unwrap_or(&port.port_type);
+            .unwrap_or(port.port_type);
         match port.serial {
-            Some(serial) => println!("{:<32} {:<24} serial={serial}", port.path, description),
+            Some(serial) => println!("{:<32} {description:<24} serial={serial}", port.path),
             None => println!("{:<32} {description}", port.path),
         }
     }
@@ -193,122 +175,70 @@ fn run_list(json_output: bool) -> Result<()> {
 }
 
 fn run_transact(
-    connection: &ConnectionArgs,
-    payload: PayloadArgs,
+    connection: ConnectionArgs,
+    payload: Payload,
     expect: Option<String>,
-    bytes: Option<usize>,
-    timeout_ms: u64,
+    bytes: Option<ReadSize>,
+    timeout_ms: TimeoutMs,
     json_output: bool,
 ) -> Result<()> {
-    let transport: Box<dyn SerialTransport> = if connection.loopback {
-        Box::new(LoopbackTransport::new())
-    } else {
-        Box::new(LocalTransport::new())
-    };
-    let mut handler = CommandHandler::new(transport, false);
-
-    let open = handler.execute(open_command(connection));
-    ensure_response(&open, json_output)?;
-
-    let write = handler.execute(Command::Write {
-        text: payload.text,
-        hex: payload.hex,
-        data_b64: payload.data_b64,
-    });
-    if !write.ok {
-        let _ = handler.execute(Command::Close);
-        ensure_response(&write, json_output)?;
+    let mut handler = CommandHandler::new(transport(connection.loopback), false);
+    let open = handler.execute(request(Command::Open(connection.open)));
+    if !open.is_ok() {
+        return finish_transaction(&open, json_output);
     }
-
-    let final_response = if let Some(pattern) = expect {
-        handler.execute(Command::Expect {
+    let write = handler.execute(request(Command::Write(payload)));
+    let last = if !write.is_ok() {
+        write
+    } else if let Some(pattern) = expect {
+        handler.execute(request(Command::Expect {
             pattern,
             timeout_ms,
-        })
+        }))
     } else if let Some(bytes) = bytes {
-        handler.execute(Command::Read { bytes, timeout_ms })
+        handler.execute(request(Command::Read { bytes, timeout_ms }))
     } else {
         write
     };
-    let _ = handler.execute(Command::Close);
-
-    emit_transaction_response(&final_response, json_output)?;
-    if !final_response.ok {
-        bail!(response_message(&final_response));
-    }
-    if final_response.command == "expect"
-        && final_response
-            .result
-            .as_ref()
-            .and_then(|result| result.get("matched"))
-            .and_then(serde_json::Value::as_bool)
-            == Some(false)
-    {
-        bail!("timeout waiting for expected pattern");
-    }
-    Ok(())
+    // Close failures cannot change the outcome; the process exits next.
+    let _ = handler.execute(request(Command::Close {}));
+    finish_transaction(&last, json_output)
 }
 
-fn open_command(connection: &ConnectionArgs) -> Command {
-    Command::Open {
-        port: connection.port.clone(),
-        serial: connection.serial.clone(),
-        baud: connection.baud,
-        bits: connection.bits,
-        parity: connection.parity,
-        stop: connection.stop,
-        dtr: connection.dtr,
-        rts: connection.rts,
-    }
-}
-
-fn ensure_response(response: &Response, json_output: bool) -> Result<()> {
-    if response.ok {
-        return Ok(());
-    }
+fn finish_transaction(response: &Response, json_output: bool) -> Result<()> {
     if json_output {
         println!("{}", serde_json::to_string(response)?);
     }
-    bail!(response_message(response))
-}
-
-fn emit_transaction_response(response: &Response, json_output: bool) -> Result<()> {
-    if json_output {
-        println!("{}", serde_json::to_string(response)?);
-        return Ok(());
-    }
-    let Some(result) = response.result.as_ref() else {
-        return Ok(());
-    };
-    if let Some(data_b64) = result.get("data_b64").and_then(serde_json::Value::as_str) {
-        let bytes = BASE64
-            .decode(data_b64)
-            .context("response contained invalid Base64")?;
-        io::stdout().write_all(&bytes)?;
-        io::stdout().flush()?;
-    } else if let Some(bytes) = result.get("bytes").and_then(serde_json::Value::as_u64) {
-        println!("wrote {bytes} bytes");
+    match &response.outcome {
+        Err(error) => bail!("{error}"),
+        Ok(Outcome::Received(received)) => {
+            if !json_output {
+                let mut stdout = io::stdout().lock();
+                stdout.write_all(&received.data)?;
+                stdout.flush()?;
+            }
+            let unmatched = received.expect == Some(None);
+            match received.end {
+                End::Disconnected => bail!("the serial device disconnected"),
+                End::Timeout if unmatched => bail!("timed out waiting for the expected pattern"),
+                End::BufferLimit => {
+                    bail!(
+                        "received {} bytes without the expected pattern",
+                        received.data.len()
+                    )
+                }
+                _ => {}
+            }
+        }
+        Ok(Outcome::Written { bytes, .. }) if !json_output => println!("wrote {bytes} bytes"),
+        Ok(_) => {}
     }
     Ok(())
-}
-
-fn response_message(response: &Response) -> String {
-    response
-        .error
-        .as_ref()
-        .map(|error| format!("{}: {}", error.code, error.message))
-        .unwrap_or_else(|| "command failed".to_owned())
 }
 
 fn run_stdio(loopback: bool, read_only: bool, fail_fast: bool) -> Result<()> {
-    let transport: Box<dyn SerialTransport> = if loopback {
-        Box::new(LoopbackTransport::new())
-    } else {
-        Box::new(LocalTransport::new())
-    };
-    let mut handler = CommandHandler::new(transport, read_only);
-    let stdin = io::stdin();
-    let mut reader = BufReader::new(stdin.lock());
+    let mut handler = CommandHandler::new(transport(loopback), read_only);
+    let mut reader = BufReader::new(io::stdin().lock());
     let mut stdout = io::stdout().lock();
     let mut line = Vec::with_capacity(4096);
 
@@ -318,32 +248,31 @@ fn run_stdio(loopback: bool, read_only: bool, fail_fast: bool) -> Result<()> {
             continue;
         }
         let response = if too_long {
-            Response::failure(
-                handler.session_id(),
-                "parse",
-                CommandError::invalid(format!("request line exceeds {MAX_LINE_BYTES} bytes")),
-            )
+            handler.reject(Rejected {
+                id: None,
+                command: "parse",
+                error: CommandError::invalid(format!(
+                    "request line exceeds {MAX_LINE_BYTES} bytes"
+                )),
+            })
         } else {
-            match serde_json::from_slice::<Command>(&line) {
-                Ok(command) => handler.execute(command),
-                Err(error) => Response::failure(
-                    handler.session_id(),
-                    "parse",
-                    CommandError::invalid(format!("invalid command JSON: {error}")),
-                ),
+            match parse_request(&line) {
+                Ok(request) => handler.execute(request),
+                Err(rejected) => handler.reject(rejected),
             }
         };
-        let failed = !response.ok;
         serde_json::to_writer(&mut stdout, &response)?;
         stdout.write_all(b"\n")?;
         stdout.flush()?;
-        if failed && fail_fast {
-            bail!("stdio stopped after protocol error");
+        if fail_fast && !response.is_ok() {
+            bail!("stdio stopped after an error response");
         }
     }
     Ok(())
 }
 
+/// Read one line into `output`, keeping at most `MAX_LINE_BYTES + 1` bytes.
+/// Returns `None` at end of input, otherwise whether the line was too long.
 fn read_limited_line<R: BufRead>(reader: &mut R, output: &mut Vec<u8>) -> io::Result<Option<bool>> {
     output.clear();
     let mut too_long = false;
@@ -356,7 +285,7 @@ fn read_limited_line<R: BufRead>(reader: &mut R, output: &mut Vec<u8>) -> io::Re
         saw_input = true;
         let newline = available.iter().position(|byte| *byte == b'\n');
         let content_bytes = newline.unwrap_or(available.len());
-        if output.len() < MAX_LINE_BYTES + 1 {
+        if output.len() <= MAX_LINE_BYTES {
             let keep = content_bytes.min(MAX_LINE_BYTES + 1 - output.len());
             output.extend_from_slice(&available[..keep]);
         }
@@ -376,59 +305,62 @@ fn trim_line_ending(line: &mut Vec<u8>) {
     }
 }
 
-fn run_terminal(connection: &ConnectionArgs) -> Result<()> {
+fn run_terminal(connection: &ConnectionArgs, crlf: bool) -> Result<()> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         bail!("terminal mode requires terminal stdin and stdout; use `sio stdio` for automation");
     }
-    let path = resolve_port(connection.port.as_deref(), connection.serial.as_deref())?;
-    let config = validated_config(
-        &path,
-        connection.baud,
-        connection.bits,
-        connection.parity.into(),
-        connection.stop,
-        connection.dtr,
-        connection.rts,
-    )?;
-    let mut transport: Box<dyn SerialTransport> = if connection.loopback {
-        Box::new(LoopbackTransport::new())
-    } else {
-        Box::new(LocalTransport::new())
-    };
+    let config = connection.open.resolve()?;
+    let mut transport = transport(connection.loopback);
     transport.open(&config)?;
     eprintln!(
-        "Connected to {path} at {} baud (Ctrl+] exits; opening may pulse DTR/RTS)",
-        connection.baud
+        "Connected to {} at {} baud (Ctrl+] exits; opening may pulse DTR/RTS)",
+        config.path, config.baud
     );
+    let raw_mode = RawModeGuard::enter()?;
+    let result = terminal_loop(transport.as_mut(), crlf);
+    drop(raw_mode);
+    // The port is already closed when the device disconnected.
+    let _ = transport.close();
+    result?;
+    eprintln!("Disconnected");
+    Ok(())
+}
 
-    let _raw_mode = RawModeGuard::enter()?;
+fn terminal_loop(transport: &mut dyn SerialTransport, crlf: bool) -> Result<()> {
     let mut stdout = io::stdout().lock();
+    let mut received = Vec::with_capacity(4096);
+    let mut display = Vec::with_capacity(8192);
+    let mut keys = Vec::with_capacity(16);
     loop {
-        let received = transport.read(4096, Duration::from_millis(10))?;
+        received.clear();
+        transport.read_into(&mut received, 4096, TERMINAL_POLL)?;
         if !received.is_empty() {
-            stdout.write_all(&received)?;
+            if crlf {
+                display.clear();
+                for &byte in &received {
+                    if byte == b'\n' {
+                        display.push(b'\r');
+                    }
+                    display.push(byte);
+                }
+                stdout.write_all(&display)?;
+            } else {
+                stdout.write_all(&received)?;
+            }
             stdout.flush()?;
         }
-        if event::poll(Duration::ZERO)? {
-            match event::read()? {
-                Event::Key(key) => match terminal_key(key) {
-                    TerminalAction::Exit => break,
-                    TerminalAction::Bytes(bytes) if !bytes.is_empty() => {
-                        transport.write(&bytes)?;
-                    }
-                    TerminalAction::Bytes(_) => {}
-                },
-                Event::Paste(text) => {
-                    transport.write(text.as_bytes())?;
+        while event::poll(Duration::ZERO)? {
+            if let Event::Key(key) = event::read()? {
+                keys.clear();
+                if !terminal_key(key, &mut keys) {
+                    return Ok(());
                 }
-                _ => {}
+                if !keys.is_empty() {
+                    transport.write(&keys)?;
+                }
             }
         }
     }
-    drop(_raw_mode);
-    transport.close()?;
-    eprintln!("\nDisconnected");
-    Ok(())
 }
 
 struct RawModeGuard;
@@ -446,56 +378,57 @@ impl Drop for RawModeGuard {
     }
 }
 
-enum TerminalAction {
-    Exit,
-    Bytes(Vec<u8>),
-}
-
-fn terminal_key(key: KeyEvent) -> TerminalAction {
+/// Append the bytes `key` sends to the device. Returns `false` for the exit
+/// key (Ctrl+], which some terminals report as Ctrl+5).
+fn terminal_key(key: KeyEvent, out: &mut Vec<u8>) -> bool {
     if key.kind == KeyEventKind::Release {
-        return TerminalAction::Bytes(Vec::new());
+        return true;
     }
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
     if key.code == KeyCode::Char('\u{1d}')
-        || (key.code == KeyCode::Char(']') && key.modifiers.contains(KeyModifiers::CONTROL))
-        || (key.code == KeyCode::Char('5') && key.modifiers.contains(KeyModifiers::CONTROL))
+        || (control && matches!(key.code, KeyCode::Char(']' | '5')))
     {
-        return TerminalAction::Exit;
+        return false;
     }
-
-    let mut bytes = Vec::new();
     if key.modifiers.contains(KeyModifiers::ALT) {
-        bytes.push(0x1b);
+        out.push(0x1b);
     }
-    match key.code {
-        KeyCode::Char(character) if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if ('4'..='7').contains(&character) {
-                bytes.push(0x1c + character as u8 - b'4');
-            } else if character.is_ascii() {
-                bytes.push((character.to_ascii_uppercase() as u8) & 0x1f);
+    let sequence: &[u8] = match key.code {
+        KeyCode::Char(character) if control => {
+            if let Ok(byte) = u8::try_from(character)
+                && byte.is_ascii()
+            {
+                out.push(match byte {
+                    b'4'..=b'7' => 0x1c + byte - b'4',
+                    _ => byte.to_ascii_uppercase() & 0x1f,
+                });
             }
+            &[]
         }
         KeyCode::Char(character) => {
             let mut encoded = [0_u8; 4];
-            bytes.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+            out.extend_from_slice(character.encode_utf8(&mut encoded).as_bytes());
+            &[]
         }
-        KeyCode::Enter => bytes.push(b'\r'),
-        KeyCode::Tab => bytes.push(b'\t'),
-        KeyCode::BackTab => bytes.extend_from_slice(b"\x1b[Z"),
-        KeyCode::Backspace => bytes.push(0x7f),
-        KeyCode::Esc => bytes.push(0x1b),
-        KeyCode::Up => bytes.extend_from_slice(b"\x1b[A"),
-        KeyCode::Down => bytes.extend_from_slice(b"\x1b[B"),
-        KeyCode::Right => bytes.extend_from_slice(b"\x1b[C"),
-        KeyCode::Left => bytes.extend_from_slice(b"\x1b[D"),
-        KeyCode::Home => bytes.extend_from_slice(b"\x1b[H"),
-        KeyCode::End => bytes.extend_from_slice(b"\x1b[F"),
-        KeyCode::Delete => bytes.extend_from_slice(b"\x1b[3~"),
-        KeyCode::Insert => bytes.extend_from_slice(b"\x1b[2~"),
-        KeyCode::PageUp => bytes.extend_from_slice(b"\x1b[5~"),
-        KeyCode::PageDown => bytes.extend_from_slice(b"\x1b[6~"),
-        _ => {}
-    }
-    TerminalAction::Bytes(bytes)
+        KeyCode::Enter => b"\r",
+        KeyCode::Tab => b"\t",
+        KeyCode::BackTab => b"\x1b[Z",
+        KeyCode::Backspace => b"\x7f",
+        KeyCode::Esc => b"\x1b",
+        KeyCode::Up => b"\x1b[A",
+        KeyCode::Down => b"\x1b[B",
+        KeyCode::Right => b"\x1b[C",
+        KeyCode::Left => b"\x1b[D",
+        KeyCode::Home => b"\x1b[H",
+        KeyCode::End => b"\x1b[F",
+        KeyCode::Delete => b"\x1b[3~",
+        KeyCode::Insert => b"\x1b[2~",
+        KeyCode::PageUp => b"\x1b[5~",
+        KeyCode::PageDown => b"\x1b[6~",
+        _ => &[],
+    };
+    out.extend_from_slice(sequence);
+    true
 }
 
 fn run_skill(output: Option<&Path>, check: Option<&Path>, force: bool) -> Result<()> {
@@ -605,23 +538,23 @@ mod tests {
         assert_eq!(line.len(), MAX_LINE_BYTES);
     }
 
+    fn key_bytes(code: KeyCode, modifiers: KeyModifiers) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        terminal_key(KeyEvent::new(code, modifiers), &mut out).then_some(out)
+    }
+
     #[test]
     fn ctrl_bracket_exits_but_ctrl_c_is_forwarded() {
-        assert!(matches!(
-            terminal_key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::CONTROL)),
-            TerminalAction::Exit
-        ));
-        assert!(matches!(
-            terminal_key(KeyEvent::new(KeyCode::Char('\u{1d}'), KeyModifiers::NONE)),
-            TerminalAction::Exit
-        ));
-        assert!(matches!(
-            terminal_key(KeyEvent::new(KeyCode::Char('5'), KeyModifiers::CONTROL)),
-            TerminalAction::Exit
-        ));
-        match terminal_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)) {
-            TerminalAction::Bytes(bytes) => assert_eq!(bytes, vec![3]),
-            TerminalAction::Exit => panic!("Ctrl+C must be forwarded"),
-        }
+        assert_eq!(key_bytes(KeyCode::Char(']'), KeyModifiers::CONTROL), None);
+        assert_eq!(key_bytes(KeyCode::Char('\u{1d}'), KeyModifiers::NONE), None);
+        assert_eq!(key_bytes(KeyCode::Char('5'), KeyModifiers::CONTROL), None);
+        assert_eq!(
+            key_bytes(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(vec![3])
+        );
+        assert_eq!(
+            key_bytes(KeyCode::Char('x'), KeyModifiers::ALT),
+            Some(b"\x1bx".to_vec())
+        );
     }
 }

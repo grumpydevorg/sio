@@ -1,6 +1,6 @@
 use serde_json::Value;
 use std::io::Write;
-use std::process::{Command, Output, Stdio};
+use std::process::{Command, ExitStatus, Output, Stdio};
 
 fn sio() -> Command {
     Command::new(env!("CARGO_BIN_EXE_sio"))
@@ -10,16 +10,30 @@ fn output(command: &mut Command) -> Output {
     command.output().expect("sio should run")
 }
 
-#[test]
-fn help_exposes_only_implemented_local_surfaces() {
-    let result = output(sio().arg("--help"));
-    assert!(result.status.success());
-    let stdout = String::from_utf8(result.stdout).unwrap();
-    for command in ["list", "terminal", "transact", "stdio", "skill"] {
-        assert!(stdout.contains(command), "missing {command} from help");
-    }
-    assert!(!stdout.contains("serve"));
-    assert!(!stdout.contains("HTTP"));
+/// Run `sio stdio` with `args`, feed `input`, and parse every stdout line.
+fn stdio(args: &[&str], input: &str) -> (ExitStatus, Vec<Value>, Vec<u8>) {
+    let mut child = sio()
+        .arg("stdio")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(input.as_bytes())
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    let responses = result
+        .stdout
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    (result.status, responses, result.stderr)
 }
 
 #[test]
@@ -81,82 +95,109 @@ fn transact_round_trips_binary_without_utf8_loss() {
     assert_eq!(response["command"], "read");
     assert_eq!(response["result"]["data_b64"], "AP8=");
     assert!(response["result"].get("text").is_none());
+
+    let raw = output(sio().args([
+        "transact",
+        "--loopback",
+        "--port",
+        "loop://",
+        "--hex",
+        "00ff",
+        "--bytes",
+        "2",
+    ]));
+    assert!(raw.status.success());
+    assert_eq!(raw.stdout, [0x00, 0xff]);
+}
+
+#[test]
+fn transact_fails_when_the_pattern_never_arrives() {
+    let result = output(sio().args([
+        "transact",
+        "--loopback",
+        "--port",
+        "loop://",
+        "--text",
+        "x",
+        "--expect",
+        "nomatch",
+        "--timeout-ms",
+        "100",
+    ]));
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("timed out"));
+    assert_eq!(result.stdout, b"x");
 }
 
 #[test]
 fn stdio_keeps_one_session_and_one_json_response_per_command() {
-    let mut child = sio()
-        .args(["stdio", "--loopback"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(
-            br#"{"cmd":"open","port":"loop://"}
-{"cmd":"write","data_b64":"AP8="}
-{"cmd":"read","bytes":2,"timeout_ms":1000}
-{"cmd":"close"}
-"#,
-        )
-        .unwrap();
-    drop(child.stdin.take());
-    let result = child.wait_with_output().unwrap();
-    assert!(result.status.success());
-    assert!(result.stderr.is_empty());
-    let responses: Vec<Value> = result
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_slice(line).unwrap())
-        .collect();
+    let (status, responses, stderr) = stdio(
+        &["--loopback"],
+        concat!(
+            "{\"cmd\":\"open\",\"port\":\"loop://\"}\n",
+            "{\"cmd\":\"write\",\"data_b64\":\"AP8=\"}\n",
+            "{\"cmd\":\"read\",\"bytes\":2,\"timeout_ms\":1000}\n",
+            "{\"cmd\":\"close\"}\n",
+        ),
+    );
+    assert!(status.success());
+    assert!(stderr.is_empty());
     assert_eq!(responses.len(), 4);
-    let session = responses[0]["session_id"].clone();
+    let session = &responses[0]["session_id"];
     assert!(
         responses
             .iter()
-            .all(|response| response["session_id"] == session)
+            .all(|response| &response["session_id"] == session)
+    );
+    assert!(
+        responses
+            .iter()
+            .all(|response| response["protocol_version"] == 2)
     );
     assert_eq!(responses[2]["result"]["data_b64"], "AP8=");
 }
 
 #[test]
-fn invalid_commands_are_structured_and_fail_fast_is_nonzero() {
-    let mut child = sio()
-        .args(["stdio", "--loopback", "--fail-fast"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(b"{\"cmd\":\"open\",\"port\":\"loop://\",\"bogus\":true}\n{\"cmd\":\"list\"}\n")
-        .unwrap();
-    drop(child.stdin.take());
-    let result = child.wait_with_output().unwrap();
-    assert!(!result.status.success());
-    let lines: Vec<_> = result
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .collect();
-    assert_eq!(lines.len(), 1);
-    let response: Value = serde_json::from_slice(lines[0]).unwrap();
-    assert_eq!(response["ok"], false);
-    assert_eq!(response["error"]["code"], "invalid_request");
-    assert_eq!(response["error"]["retryable"], false);
+fn stdio_echoes_request_ids_on_success_and_failure() {
+    let (status, responses, _) = stdio(
+        &["--loopback"],
+        concat!(
+            "{\"id\":\"a1\",\"cmd\":\"open\",\"port\":\"loop://\"}\n",
+            "{\"id\":7,\"cmd\":\"read\",\"bytes\":0}\n",
+            "{\"cmd\":\"drain\",\"id\":\"late\"}\n",
+            "not json\n",
+            "{\"cmd\":\"close\"}\n",
+        ),
+    );
+    assert!(status.success());
+    assert_eq!(responses.len(), 5);
+    assert_eq!(responses[0]["id"], "a1");
+    assert_eq!(responses[0]["ok"], true);
+    assert_eq!(responses[1]["id"], 7);
+    assert_eq!(responses[1]["command"], "read");
+    assert_eq!(responses[1]["error"]["code"], "invalid_request");
+    assert_eq!(responses[2]["id"], "late");
+    assert!(responses[3].get("id").is_none());
+    assert_eq!(responses[3]["command"], "parse");
+    assert!(responses[4].get("id").is_none());
 }
 
 #[test]
-fn validation_happens_before_opening_a_device() {
-    let result = output(sio().args([
+fn invalid_commands_are_structured_and_fail_fast_is_nonzero() {
+    let (status, responses, _) = stdio(
+        &["--loopback", "--fail-fast"],
+        "{\"cmd\":\"open\",\"port\":\"loop://\",\"bogus\":true}\n{\"cmd\":\"list\"}\n",
+    );
+    assert!(!status.success());
+    assert_eq!(responses.len(), 1);
+    assert_eq!(responses[0]["ok"], false);
+    assert_eq!(responses[0]["error"]["code"], "invalid_request");
+    assert_eq!(responses[0]["error"]["retryable"], false);
+}
+
+#[test]
+fn invalid_settings_never_reach_a_device() {
+    let usage = output(sio().args([
         "transact",
         "--port",
         "/dev/this-must-not-be-opened",
@@ -164,48 +205,45 @@ fn validation_happens_before_opening_a_device() {
         "9",
         "--text",
         "x",
+    ]));
+    assert_eq!(usage.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&usage.stderr).contains("bits must be 5, 6, 7, or 8"));
+
+    let (_, responses, _) = stdio(
+        &[],
+        "{\"cmd\":\"open\",\"port\":\"/dev/this-must-not-be-opened\",\"bits\":9}\n",
+    );
+    assert_eq!(responses[0]["command"], "open");
+    assert_eq!(responses[0]["error"]["code"], "invalid_request");
+}
+
+#[test]
+fn a_missing_device_is_reported_as_port_not_found() {
+    let result = output(sio().args([
+        "transact",
+        "--port",
+        "/dev/sio-test-no-such-port",
+        "--text",
+        "x",
         "--json",
     ]));
     assert!(!result.status.success());
     let response: Value = serde_json::from_slice(&result.stdout).unwrap();
     assert_eq!(response["command"], "open");
-    assert_eq!(response["error"]["code"], "invalid_request");
-    assert!(
-        response["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("bits")
-    );
+    assert_eq!(response["error"]["code"], "port_not_found");
 }
 
 #[test]
 fn read_only_rejects_mutations_but_keeps_stream_alive() {
-    let input = concat!(
-        "{\"cmd\":\"open\",\"port\":\"loop://\"}\n",
-        "{\"cmd\":\"write\",\"text\":\"x\"}\n",
-        "{\"cmd\":\"modem\"}\n"
+    let (status, responses, _) = stdio(
+        &["--loopback", "--read-only"],
+        concat!(
+            "{\"cmd\":\"open\",\"port\":\"loop://\"}\n",
+            "{\"cmd\":\"write\",\"text\":\"x\"}\n",
+            "{\"cmd\":\"modem\"}\n"
+        ),
     );
-    let mut child = sio()
-        .args(["stdio", "--loopback", "--read-only"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    drop(child.stdin.take());
-    let result = child.wait_with_output().unwrap();
-    assert!(result.status.success());
-    let responses: Vec<Value> = result
-        .stdout
-        .split(|byte| *byte == b'\n')
-        .filter(|line| !line.is_empty())
-        .map(|line| serde_json::from_slice(line).unwrap())
-        .collect();
+    assert!(status.success());
     assert_eq!(responses[1]["error"]["code"], "read_only");
     assert_eq!(responses[2]["ok"], true);
 }

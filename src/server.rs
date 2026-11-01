@@ -1,22 +1,35 @@
-//! Stateful command handling for the local NDJSON interface.
+//! Stateful command execution for one serial session.
+//!
+//! Received bytes that a command has not returned yet stay in one pending
+//! buffer, so every read-type command sees them in arrival order and a
+//! transport error never discards data.
 
 use crate::protocol::{
-    Command, CommandError, LineState as ProtocolLineState, MAX_BREAK_MS, MAX_IO_BYTES,
-    MAX_TIMEOUT_MS, PortInfo as ProtocolPortInfo, Response,
+    Command, CommandError, End, ErrorCode, MAX_IO_BYTES, Outcome, Received, Rejected, Request,
+    RequestId, Response, SideEffect, TimeoutMs,
 };
-use crate::transport::{LineState, PortConfig, SerialTransport, TransportError, list_ports};
-use base64::Engine;
-use base64::engine::general_purpose::STANDARD as BASE64;
+use crate::transport::{SerialTransport, TransportError, list_ports};
 use regex::bytes::Regex;
-use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+/// Longest wait between pattern checks during `expect`.
+const EXPECT_POLL: Duration = Duration::from_millis(100);
+/// How long `drain` waits for bytes already in flight.
+const DRAIN_WAIT: Duration = Duration::from_millis(50);
+/// Largest single transport read.
+const CHUNK: usize = 4096;
+
+const OPEN_WARNING: &str =
+    "Opening a serial port may pulse DTR or RTS on some operating systems and adapters";
 
 pub struct CommandHandler {
     transport: Box<dyn SerialTransport>,
-    expect_buffer: Vec<u8>,
+    /// Received, not yet returned. Never longer than `MAX_IO_BYTES`.
+    pending: Vec<u8>,
     read_only: bool,
-    session_id: String,
+    session_id: Arc<str>,
 }
 
 impl CommandHandler {
@@ -27,149 +40,119 @@ impl CommandHandler {
             .map_or(0, |duration| duration.as_nanos());
         Self {
             transport,
-            expect_buffer: Vec::with_capacity(4096),
+            pending: Vec::new(),
             read_only,
-            session_id: format!("{}-{epoch_nanos}", std::process::id()),
+            session_id: format!("{}-{epoch_nanos}", std::process::id()).into(),
         }
     }
 
+    pub fn execute(&mut self, request: Request) -> Response {
+        let command = request.command.name();
+        let outcome = self.run(request.command);
+        self.respond(request.id, command, outcome)
+    }
+
+    /// Answer a request line that failed to parse.
     #[must_use]
-    pub fn session_id(&self) -> &str {
-        &self.session_id
+    pub fn reject(&self, rejected: Rejected) -> Response {
+        self.respond(rejected.id, rejected.command, Err(rejected.error))
     }
 
-    pub fn execute(&mut self, command: Command) -> Response {
-        let name = command.name();
-        match self.execute_inner(command) {
-            Ok(result) => Response::success(&self.session_id, name, result),
-            Err(error) => Response::failure(&self.session_id, name, error),
+    fn respond(
+        &self,
+        id: Option<RequestId>,
+        command: &'static str,
+        outcome: Result<Outcome, CommandError>,
+    ) -> Response {
+        Response {
+            id,
+            session_id: Arc::clone(&self.session_id),
+            command,
+            outcome,
         }
     }
 
-    fn execute_inner(&mut self, command: Command) -> Result<Value, CommandError> {
+    fn run(&mut self, command: Command) -> Result<Outcome, CommandError> {
         match command {
-            Command::List => Ok(json!({ "ports": discover_ports()? })),
-            Command::Open {
-                port,
-                serial,
-                baud,
-                bits,
-                parity,
-                stop,
-                dtr,
-                rts,
-            } => {
-                let path = resolve_port(port.as_deref(), serial.as_deref())?;
-                let config = validated_config(&path, baud, bits, parity.into(), stop, dtr, rts)?;
-                self.transport.open(&config).map_err(map_effect_error)?;
-                self.expect_buffer.clear();
-                Ok(json!({
-                    "port": path,
-                    "baud": baud,
-                    "bits": bits,
-                    "parity": format!("{parity:?}").to_lowercase(),
-                    "stop": stop,
-                    "dtr": line_state_name(dtr),
-                    "rts": line_state_name(rts),
-                    "side_effect": "serial_port_opened",
-                    "retry_safe": false,
-                    "warning": "Opening a serial port may pulse DTR or RTS on some operating systems and adapters"
-                }))
+            Command::List {} => Ok(Outcome::Ports {
+                ports: list_ports().map_err(|error| CommandError::from_transport(&error, false))?,
+            }),
+            Command::Open(params) => {
+                let config = params.resolve()?;
+                self.transport
+                    .open(&config)
+                    .map_err(|error| CommandError::from_transport(&error, true))?;
+                self.pending.clear();
+                Ok(Outcome::Opened {
+                    port: config.path,
+                    baud: config.baud,
+                    bits: config.data_bits,
+                    parity: config.parity,
+                    stop: config.stop_bits,
+                    dtr: config.dtr,
+                    rts: config.rts,
+                    effect: SideEffect::SerialPortOpened.into(),
+                    warning: OPEN_WARNING,
+                })
             }
-            Command::Close => {
-                self.transport.close().map_err(map_transport_error)?;
-                self.expect_buffer.clear();
-                Ok(json!({ "side_effect": "serial_port_closed", "retry_safe": true }))
+            Command::Close {} => {
+                self.transport
+                    .close()
+                    .map_err(|error| CommandError::from_transport(&error, false))?;
+                let discarded_bytes = self.pending.len();
+                self.pending.clear();
+                Ok(Outcome::Closed {
+                    discarded_bytes,
+                    effect: SideEffect::SerialPortClosed.into(),
+                })
             }
-            Command::Write {
-                text,
-                hex,
-                data_b64,
-            } => {
+            Command::Write(payload) => {
                 self.ensure_writable("write")?;
-                let (encoding, bytes) = decode_payload(text, hex, data_b64)?;
-                let written = self.transport.write(&bytes).map_err(map_effect_error)?;
-                if written != bytes.len() {
-                    return Err(CommandError::new(
-                        "short_write",
-                        format!("wrote {written} of {} bytes", bytes.len()),
-                        false,
-                    ));
-                }
-                Ok(json!({
-                    "encoding": encoding,
-                    "bytes": written,
-                    "side_effect": "serial_bytes_written",
-                    "retry_safe": false
-                }))
+                let (encoding, bytes) = payload.decode()?;
+                self.transport
+                    .write(&bytes)
+                    .map_err(|error| CommandError::from_transport(&error, true))?;
+                Ok(Outcome::Written {
+                    encoding,
+                    bytes: bytes.len(),
+                    effect: SideEffect::SerialBytesWritten.into(),
+                })
             }
-            Command::Read { bytes, timeout_ms } => {
-                validate_io_size(bytes)?;
-                validate_timeout(timeout_ms)?;
-                let start = Instant::now();
-                let data = self
-                    .transport
-                    .read(bytes, Duration::from_millis(timeout_ms))
-                    .map_err(map_transport_error)?;
-                let end = if data.len() == bytes {
-                    "byte_limit"
-                } else if data.is_empty() {
-                    "timeout"
-                } else {
-                    "idle"
-                };
-                Ok(read_result(&data, start.elapsed(), end))
-            }
+            Command::Read { bytes, timeout_ms } => self.read(bytes.bytes(), timeout_ms),
             Command::Readline { timeout_ms } => self.readline(timeout_ms),
             Command::Expect {
                 pattern,
                 timeout_ms,
             } => self.expect(&pattern, timeout_ms),
-            Command::Drain => {
-                let data = self.transport.drain().map_err(map_transport_error)?;
-                let end = if data.len() == MAX_IO_BYTES {
-                    "byte_limit"
-                } else {
-                    "idle"
-                };
-                Ok(read_result(&data, Duration::ZERO, end))
-            }
+            Command::Drain {} => self.drain(),
             Command::Modem { dtr, rts } => {
-                if dtr.is_some() || rts.is_some() {
+                let changes = dtr.is_some() || rts.is_some();
+                if changes {
                     self.ensure_writable("modem-line change")?;
                 }
-                let status = self.transport.modem_control(dtr, rts).map_err(|error| {
-                    if dtr.is_some() || rts.is_some() {
-                        map_effect_error(error)
-                    } else {
-                        map_transport_error(error)
-                    }
-                })?;
-                Ok(json!({
-                    "dtr": status.dtr,
-                    "rts": status.rts,
-                    "cts": status.cts,
-                    "dsr": status.dsr,
-                    "dcd": status.dcd,
-                    "side_effect": if dtr.is_some() || rts.is_some() { "modem_lines_changed" } else { "none" },
-                    "retry_safe": dtr.is_none() && rts.is_none()
-                }))
+                let status = self
+                    .transport
+                    .modem_control(dtr, rts)
+                    .map_err(|error| CommandError::from_transport(&error, changes))?;
+                let effect = if changes {
+                    SideEffect::ModemLinesChanged
+                } else {
+                    SideEffect::None
+                };
+                Ok(Outcome::Modem {
+                    status,
+                    effect: effect.into(),
+                })
             }
             Command::Break { duration_ms } => {
                 self.ensure_writable("break")?;
-                if !(1..=MAX_BREAK_MS).contains(&duration_ms) {
-                    return Err(CommandError::invalid(format!(
-                        "duration_ms must be between 1 and {MAX_BREAK_MS}"
-                    )));
-                }
                 self.transport
-                    .send_break(Duration::from_millis(duration_ms))
-                    .map_err(map_effect_error)?;
-                Ok(json!({
-                    "duration_ms": duration_ms,
-                    "side_effect": "serial_break_sent",
-                    "retry_safe": false
-                }))
+                    .send_break(Duration::from_millis(duration_ms.get()))
+                    .map_err(|error| CommandError::from_transport(&error, true))?;
+                Ok(Outcome::Break {
+                    duration_ms,
+                    effect: SideEffect::SerialBreakSent.into(),
+                })
             }
         }
     }
@@ -177,7 +160,7 @@ impl CommandHandler {
     fn ensure_writable(&self, operation: &str) -> Result<(), CommandError> {
         if self.read_only {
             Err(CommandError::new(
-                "read_only",
+                ErrorCode::ReadOnly,
                 format!("{operation} is disabled by --read-only"),
                 false,
             ))
@@ -186,41 +169,85 @@ impl CommandHandler {
         }
     }
 
-    fn readline(&mut self, timeout_ms: u64) -> Result<Value, CommandError> {
-        validate_timeout(timeout_ms)?;
-        let start = Instant::now();
-        let timeout = Duration::from_millis(timeout_ms);
-        let mut line = Vec::new();
-
-        while start.elapsed() < timeout && line.len() < MAX_IO_BYTES {
-            let remaining = timeout.saturating_sub(start.elapsed());
-            let data = self
-                .transport
-                .read(1, remaining)
-                .map_err(map_transport_error)?;
-            if data.is_empty() {
-                break;
-            }
-            line.push(data[0]);
-            if data[0] == b'\n' {
-                break;
-            }
+    /// Receive into `pending`, leaving room for at most `limit` buffered bytes.
+    /// `Ok(false)` means the device disconnected.
+    fn receive(&mut self, limit: usize, wait: Duration) -> Result<bool, CommandError> {
+        let room = limit.saturating_sub(self.pending.len()).min(CHUNK);
+        match self.transport.read_into(&mut self.pending, room, wait) {
+            Ok(()) => Ok(true),
+            Err(TransportError::Disconnected) => Ok(false),
+            Err(error) => Err(CommandError::from_transport(&error, false)),
         }
-
-        let end = if line.last() == Some(&b'\n') {
-            "newline"
-        } else if line.len() == MAX_IO_BYTES {
-            "byte_limit"
-        } else if line.is_empty() {
-            "timeout"
-        } else {
-            "idle"
-        };
-        Ok(read_result(&line, start.elapsed(), end))
     }
 
-    fn expect(&mut self, pattern: &str, timeout_ms: u64) -> Result<Value, CommandError> {
-        validate_timeout(timeout_ms)?;
+    /// Return and consume the first `count` pending bytes.
+    fn take(&mut self, count: usize, start: Instant, end: End) -> Received {
+        let rest = self.pending.split_off(count.min(self.pending.len()));
+        Received {
+            data: std::mem::replace(&mut self.pending, rest),
+            elapsed: start.elapsed(),
+            end,
+            expect: None,
+        }
+    }
+
+    fn read(&mut self, bytes: usize, timeout_ms: TimeoutMs) -> Result<Outcome, CommandError> {
+        let start = Instant::now();
+        let timeout = timeout_ms.duration();
+        let end = loop {
+            if self.pending.len() >= bytes {
+                break End::ByteLimit;
+            }
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break if self.pending.is_empty() {
+                    End::Timeout
+                } else {
+                    End::Idle
+                };
+            }
+            let before = self.pending.len();
+            // Wait the full timeout only for the first byte.
+            let wait = if before == 0 {
+                remaining
+            } else {
+                remaining.min(DRAIN_WAIT)
+            };
+            if !self.receive(bytes, wait)? {
+                break End::Disconnected;
+            }
+            if before > 0 && self.pending.len() == before {
+                break End::Idle;
+            }
+        };
+        Ok(Outcome::Received(self.take(bytes, start, end)))
+    }
+
+    fn readline(&mut self, timeout_ms: TimeoutMs) -> Result<Outcome, CommandError> {
+        let start = Instant::now();
+        let timeout = timeout_ms.duration();
+        let mut scanned = 0;
+        let end = loop {
+            if let Some(offset) = memchr_newline(&self.pending[scanned..]) {
+                let count = scanned + offset + 1;
+                return Ok(Outcome::Received(self.take(count, start, End::Newline)));
+            }
+            scanned = self.pending.len();
+            if self.pending.len() >= MAX_IO_BYTES {
+                break End::ByteLimit;
+            }
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break End::Timeout;
+            }
+            if !self.receive(MAX_IO_BYTES, remaining)? {
+                break End::Disconnected;
+            }
+        };
+        Ok(Outcome::Received(self.take(MAX_IO_BYTES, start, end)))
+    }
+
+    fn expect(&mut self, pattern: &str, timeout_ms: TimeoutMs) -> Result<Outcome, CommandError> {
         if pattern.len() > MAX_IO_BYTES {
             return Err(CommandError::invalid(format!(
                 "pattern exceeds {MAX_IO_BYTES} bytes"
@@ -229,371 +256,182 @@ impl CommandHandler {
         let regex = Regex::new(pattern)
             .map_err(|error| CommandError::invalid(format!("invalid byte regex: {error}")))?;
         let start = Instant::now();
-        let timeout = Duration::from_millis(timeout_ms);
-
-        while start.elapsed() < timeout {
-            if let Some(found) = regex.find(&self.expect_buffer) {
-                return Ok(self.finish_expect(Some(found.range()), start.elapsed(), "match"));
+        let timeout = timeout_ms.duration();
+        let (count, end, matched) = loop {
+            if let Some(found) = regex.find(&self.pending) {
+                let range: Range<usize> = found.range();
+                break (range.end, End::Match, Some(range));
             }
-            if self.expect_buffer.len() == MAX_IO_BYTES {
-                return Err(CommandError::new(
-                    "buffer_limit",
-                    format!("expect buffer reached {MAX_IO_BYTES} bytes"),
-                    false,
-                ));
+            if self.pending.len() >= MAX_IO_BYTES {
+                break (MAX_IO_BYTES, End::BufferLimit, None);
             }
-
             let remaining = timeout.saturating_sub(start.elapsed());
-            let room = MAX_IO_BYTES - self.expect_buffer.len();
-            let data = self
-                .transport
-                .read(room.min(4096), remaining.min(Duration::from_millis(100)))
-                .map_err(map_transport_error)?;
-            if data.is_empty() {
-                continue;
+            if remaining.is_zero() {
+                break (MAX_IO_BYTES, End::Timeout, None);
             }
-            self.expect_buffer.extend_from_slice(&data);
-            if let Some(range) = regex.find(&self.expect_buffer).map(|found| found.range()) {
-                return Ok(self.finish_expect(Some(range), start.elapsed(), "match"));
+            if !self.receive(MAX_IO_BYTES, remaining.min(EXPECT_POLL))? {
+                if let Some(found) = regex.find(&self.pending) {
+                    let range = found.range();
+                    break (range.end, End::Match, Some(range));
+                }
+                break (MAX_IO_BYTES, End::Disconnected, None);
             }
-        }
-
-        Ok(self.finish_expect(None, start.elapsed(), "timeout"))
-    }
-
-    fn finish_expect(
-        &mut self,
-        matched_range: Option<std::ops::Range<usize>>,
-        elapsed: Duration,
-        end: &str,
-    ) -> Value {
-        let data = std::mem::take(&mut self.expect_buffer);
-        let mut result = read_result(&data, elapsed, end);
-        let object = result.as_object_mut().expect("read result is an object");
-        object.insert("matched".to_owned(), json!(matched_range.is_some()));
-        if let Some(range) = matched_range {
-            let matched = &data[range];
-            object.insert("matched_b64".to_owned(), json!(BASE64.encode(matched)));
-            if let Ok(text) = std::str::from_utf8(matched) {
-                object.insert("matched_text".to_owned(), json!(text));
-            }
-        }
-        result
-    }
-}
-
-pub fn discover_ports() -> Result<Vec<ProtocolPortInfo>, CommandError> {
-    let mut ports: BTreeMap<String, ProtocolPortInfo> = BTreeMap::new();
-    for port in list_ports().map_err(map_transport_error)? {
-        let recommended = !cfg!(target_os = "macos") || port.path.starts_with("/dev/cu.");
-        let key = macos_pair_key(&port.path);
-        let candidate = ProtocolPortInfo {
-            path: port.path,
-            port_type: port.port_type,
-            recommended_for_open: recommended,
-            vid: port.vid,
-            pid: port.pid,
-            serial: port.serial,
-            manufacturer: port.manufacturer,
-            product: port.product,
         };
-        match ports.get(&key) {
-            Some(existing) if existing.recommended_for_open || !candidate.recommended_for_open => {}
-            _ => {
-                ports.insert(key, candidate);
+        let mut received = self.take(count, start, end);
+        received.expect = Some(matched);
+        Ok(Outcome::Received(received))
+    }
+
+    fn drain(&mut self) -> Result<Outcome, CommandError> {
+        let start = Instant::now();
+        let mut end = End::Idle;
+        while self.pending.len() < MAX_IO_BYTES {
+            let before = self.pending.len();
+            if !self.receive(MAX_IO_BYTES, DRAIN_WAIT)? {
+                end = End::Disconnected;
+                break;
+            }
+            if self.pending.len() == before {
+                break;
             }
         }
-    }
-    Ok(ports.into_values().collect())
-}
-
-fn macos_pair_key(path: &str) -> String {
-    if cfg!(target_os = "macos") {
-        path.strip_prefix("/dev/cu.")
-            .or_else(|| path.strip_prefix("/dev/tty."))
-            .unwrap_or(path)
-            .to_owned()
-    } else {
-        path.to_owned()
-    }
-}
-
-pub fn resolve_port(port: Option<&str>, serial: Option<&str>) -> Result<String, CommandError> {
-    match (port, serial) {
-        (Some(path), None) if !path.is_empty() => Ok(path.to_owned()),
-        (None, Some(serial)) if !serial.is_empty() => {
-            let matches: Vec<_> = discover_ports()?
-                .into_iter()
-                .filter(|port| port.serial.as_deref() == Some(serial))
-                .collect();
-            match matches.as_slice() {
-                [] => Err(CommandError::new(
-                    "port_not_found",
-                    format!("no serial port has USB serial number {serial:?}"),
-                    false,
-                )),
-                [port] => Ok(port.path.clone()),
-                _ => Err(CommandError::new(
-                    "ambiguous_port",
-                    format!("more than one serial port has USB serial number {serial:?}"),
-                    false,
-                )),
-            }
+        if end == End::Idle && self.pending.len() >= MAX_IO_BYTES {
+            end = End::ByteLimit;
         }
-        (Some(_), Some(_)) => Err(CommandError::invalid(
-            "specify exactly one of port or serial",
-        )),
-        _ => Err(CommandError::invalid(
-            "specify exactly one non-empty port or serial",
-        )),
+        Ok(Outcome::Received(self.take(MAX_IO_BYTES, start, end)))
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn validated_config(
-    path: &str,
-    baud: u32,
-    bits: u8,
-    parity: crate::transport::Parity,
-    stop: u8,
-    dtr: ProtocolLineState,
-    rts: ProtocolLineState,
-) -> Result<PortConfig, CommandError> {
-    if path.is_empty() {
-        return Err(CommandError::invalid("port cannot be empty"));
-    }
-    if !(1..=4_000_000).contains(&baud) {
-        return Err(CommandError::invalid("baud must be between 1 and 4000000"));
-    }
-    if !(5..=8).contains(&bits) {
-        return Err(CommandError::invalid("bits must be 5, 6, 7, or 8"));
-    }
-    if !matches!(stop, 1 | 2) {
-        return Err(CommandError::invalid("stop must be 1 or 2"));
-    }
-    Ok(PortConfig::new(path, baud)
-        .data_bits(bits)
-        .parity(parity)
-        .stop_bits(stop)
-        .dtr_on_open(LineState::from(dtr))
-        .rts_on_open(LineState::from(rts)))
-}
-
-pub fn decode_payload(
-    text: Option<String>,
-    hex: Option<String>,
-    data_b64: Option<String>,
-) -> Result<(&'static str, Vec<u8>), CommandError> {
-    let supplied =
-        usize::from(text.is_some()) + usize::from(hex.is_some()) + usize::from(data_b64.is_some());
-    if supplied != 1 {
-        return Err(CommandError::invalid(
-            "specify exactly one of text, hex, or data_b64",
-        ));
-    }
-
-    let (encoding, bytes) = if let Some(value) = text {
-        ("text", decode_text_escapes(&value)?)
-    } else if let Some(value) = hex {
-        let compact: String = value
-            .chars()
-            .filter(|character| !character.is_whitespace())
-            .collect();
-        if !compact.bytes().all(|byte| byte.is_ascii_hexdigit()) {
-            return Err(CommandError::invalid("hex contains a non-hexadecimal byte"));
-        }
-        if compact.len() % 2 != 0 {
-            return Err(CommandError::invalid(
-                "hex must contain complete byte pairs",
-            ));
-        }
-        let decoded = (0..compact.len())
-            .step_by(2)
-            .map(|index| {
-                u8::from_str_radix(&compact[index..index + 2], 16)
-                    .map_err(|_| CommandError::invalid("hex contains a non-hexadecimal byte"))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        ("hex", decoded)
-    } else {
-        let value = data_b64.expect("one payload variant is present");
-        let decoded = BASE64
-            .decode(value)
-            .map_err(|error| CommandError::invalid(format!("invalid Base64 payload: {error}")))?;
-        ("base64", decoded)
-    };
-
-    if bytes.is_empty() {
-        return Err(CommandError::invalid("payload cannot be empty"));
-    }
-    if bytes.len() > MAX_IO_BYTES {
-        return Err(CommandError::invalid(format!(
-            "payload exceeds {MAX_IO_BYTES} bytes"
-        )));
-    }
-    Ok((encoding, bytes))
-}
-
-pub fn decode_text_escapes(value: &str) -> Result<Vec<u8>, CommandError> {
-    let mut output = Vec::with_capacity(value.len());
-    let mut chars = value.chars();
-    while let Some(character) = chars.next() {
-        if character != '\\' {
-            let mut bytes = [0_u8; 4];
-            output.extend_from_slice(character.encode_utf8(&mut bytes).as_bytes());
-            continue;
-        }
-        match chars.next() {
-            Some('n') => output.push(b'\n'),
-            Some('r') => output.push(b'\r'),
-            Some('t') => output.push(b'\t'),
-            Some('\\') => output.push(b'\\'),
-            Some('x') => {
-                let high = chars
-                    .next()
-                    .and_then(|value| value.to_digit(16))
-                    .ok_or_else(|| {
-                        CommandError::invalid("\\x must be followed by two hex digits")
-                    })?;
-                let low = chars
-                    .next()
-                    .and_then(|value| value.to_digit(16))
-                    .ok_or_else(|| {
-                        CommandError::invalid("\\x must be followed by two hex digits")
-                    })?;
-                output.push((high * 16 + low) as u8);
-            }
-            Some(other) => {
-                return Err(CommandError::invalid(format!(
-                    "unsupported text escape \\{other}"
-                )));
-            }
-            None => return Err(CommandError::invalid("text ends with an incomplete escape")),
-        }
-    }
-    Ok(output)
-}
-
-fn validate_io_size(bytes: usize) -> Result<(), CommandError> {
-    if !(1..=MAX_IO_BYTES).contains(&bytes) {
-        Err(CommandError::invalid(format!(
-            "bytes must be between 1 and {MAX_IO_BYTES}"
-        )))
-    } else {
-        Ok(())
-    }
-}
-
-fn validate_timeout(timeout_ms: u64) -> Result<(), CommandError> {
-    if !(1..=MAX_TIMEOUT_MS).contains(&timeout_ms) {
-        Err(CommandError::invalid(format!(
-            "timeout_ms must be between 1 and {MAX_TIMEOUT_MS}"
-        )))
-    } else {
-        Ok(())
-    }
-}
-
-fn read_result(data: &[u8], elapsed: Duration, end: &str) -> Value {
-    let mut result = json!({
-        "data_b64": BASE64.encode(data),
-        "bytes": data.len(),
-        "elapsed_ms": u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX),
-        "end": end,
-        "consumes_input": true
-    });
-    if let Ok(text) = std::str::from_utf8(data) {
-        result
-            .as_object_mut()
-            .expect("read result is an object")
-            .insert("text".to_owned(), json!(text));
-    }
-    result
-}
-
-fn line_state_name(state: ProtocolLineState) -> &'static str {
-    match state {
-        ProtocolLineState::Preserve => "preserve",
-        ProtocolLineState::On => "on",
-        ProtocolLineState::Off => "off",
-    }
-}
-
-fn map_transport_error(error: TransportError) -> CommandError {
-    match error {
-        TransportError::NotOpen => CommandError::new("not_open", error.to_string(), false),
-        TransportError::AlreadyOpen => CommandError::new("already_open", error.to_string(), false),
-        TransportError::InvalidConfig(_) => {
-            CommandError::new("invalid_request", error.to_string(), false)
-        }
-        TransportError::NotSupported(_) => {
-            CommandError::new("not_supported", error.to_string(), false)
-        }
-        TransportError::Timeout => CommandError::new("timeout", error.to_string(), true),
-        TransportError::ConnectionFailed(_)
-        | TransportError::WriteFailed(_)
-        | TransportError::ReadFailed(_)
-        | TransportError::Io(_) => CommandError::new("transport", error.to_string(), true),
-    }
-}
-
-fn map_effect_error(error: TransportError) -> CommandError {
-    let code = match &error {
-        TransportError::NotOpen => "not_open",
-        TransportError::AlreadyOpen => "already_open",
-        TransportError::InvalidConfig(_) => "invalid_request",
-        TransportError::NotSupported(_) => "not_supported",
-        TransportError::Timeout => "timeout",
-        TransportError::ConnectionFailed(_)
-        | TransportError::WriteFailed(_)
-        | TransportError::ReadFailed(_)
-        | TransportError::Io(_) => "transport",
-    };
-    CommandError::new(code, error.to_string(), false)
+fn memchr_newline(bytes: &[u8]) -> Option<usize> {
+    bytes.iter().position(|byte| *byte == b'\n')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::parse_request;
     use crate::transport::LoopbackTransport;
+    use serde_json::Value;
 
-    #[test]
-    fn payload_requires_exactly_one_encoding() {
-        assert!(decode_payload(None, None, None).is_err());
-        assert!(decode_payload(Some("x".into()), Some("78".into()), None).is_err());
-        assert!(decode_payload(None, Some("€€".into()), None).is_err());
+    fn run(handler: &mut CommandHandler, line: &str) -> Value {
+        let response = match parse_request(line.as_bytes()) {
+            Ok(request) => handler.execute(request),
+            Err(rejected) => handler.reject(rejected),
+        };
+        serde_json::to_value(&response).unwrap()
+    }
+
+    fn open_loopback() -> CommandHandler {
+        let mut handler = CommandHandler::new(Box::new(LoopbackTransport::new()), false);
+        assert_eq!(
+            run(&mut handler, r#"{"cmd":"open","port":"loop://"}"#)["ok"],
+            true
+        );
+        handler
     }
 
     #[test]
-    fn loopback_preserves_binary_bytes() {
-        let mut handler = CommandHandler::new(Box::new(LoopbackTransport::new()), false);
-        assert!(
-            handler
-                .execute(Command::Open {
-                    port: Some("loop://".into()),
-                    serial: None,
-                    baud: 115_200,
-                    bits: 8,
-                    parity: crate::protocol::Parity::None,
-                    stop: 1,
-                    dtr: ProtocolLineState::Preserve,
-                    rts: ProtocolLineState::Preserve,
-                })
-                .ok
+    fn full_expect_window_returns_every_byte_and_recovers() {
+        let mut handler = open_loopback();
+        let chunk = "QUFB".repeat(10_000); // 30 000 bytes of 'A'
+        for _ in 0..36 {
+            let line = format!(r#"{{"cmd":"write","data_b64":"{chunk}"}}"#);
+            assert_eq!(run(&mut handler, &line)["ok"], true);
+        }
+        let full = run(
+            &mut handler,
+            r#"{"cmd":"expect","pattern":"ZZZ","timeout_ms":5000}"#,
         );
-        assert!(
-            handler
-                .execute(Command::Write {
-                    text: None,
-                    hex: Some("00ff".into()),
-                    data_b64: None,
-                })
-                .ok
+        assert_eq!(full["ok"], true, "{full}");
+        assert_eq!(full["result"]["end"], "buffer_limit");
+        assert_eq!(full["result"]["matched"], false);
+        assert_eq!(full["result"]["bytes"], MAX_IO_BYTES);
+
+        assert_eq!(
+            run(&mut handler, r#"{"cmd":"write","text":"ZZZ"}"#)["ok"],
+            true
         );
-        let response = handler.execute(Command::Read {
-            bytes: 2,
-            timeout_ms: 100,
-        });
-        assert_eq!(response.result.unwrap()["data_b64"], "AP8=");
+        let next = run(
+            &mut handler,
+            r#"{"cmd":"expect","pattern":"ZZZ","timeout_ms":1000}"#,
+        );
+        assert_eq!(next["result"]["end"], "match", "{next}");
+        // 36 * 30 000 - 1 MiB leftover bytes, then the match.
+        assert_eq!(next["result"]["bytes"], 36 * 30_000 - MAX_IO_BYTES + 3);
+    }
+
+    #[test]
+    fn expect_leaves_bytes_after_the_match_for_the_next_command() {
+        let mut handler = open_loopback();
+        run(&mut handler, r#"{"cmd":"write","text":"OK\r\nNEXT\n"}"#);
+        let matched = run(
+            &mut handler,
+            r#"{"cmd":"expect","pattern":"OK\\r\\n","timeout_ms":500}"#,
+        );
+        assert_eq!(matched["result"]["text"], "OK\r\n");
+        assert_eq!(matched["result"]["matched_text"], "OK\r\n");
+        let line = run(&mut handler, r#"{"cmd":"readline","timeout_ms":500}"#);
+        assert_eq!(line["result"]["text"], "NEXT\n");
+        assert_eq!(line["result"]["end"], "newline");
+    }
+
+    #[test]
+    fn readline_returns_one_line_at_a_time() {
+        let mut handler = open_loopback();
+        run(&mut handler, r#"{"cmd":"write","text":"a\nb\npartial"}"#);
+        for expected in ["a\n", "b\n"] {
+            let line = run(&mut handler, r#"{"cmd":"readline","timeout_ms":200}"#);
+            assert_eq!(line["result"]["text"], expected);
+        }
+        let rest = run(&mut handler, r#"{"cmd":"readline","timeout_ms":50}"#);
+        assert_eq!(rest["result"]["text"], "partial");
+        assert_eq!(rest["result"]["end"], "timeout");
+    }
+
+    #[test]
+    fn read_returns_buffered_bytes_before_new_ones() {
+        let mut handler = open_loopback();
+        run(&mut handler, r#"{"cmd":"write","hex":"00ff10"}"#);
+        let first = run(&mut handler, r#"{"cmd":"read","bytes":2,"timeout_ms":200}"#);
+        assert_eq!(first["result"]["data_b64"], "AP8=");
+        assert_eq!(first["result"]["end"], "byte_limit");
+        assert!(first["result"].get("text").is_none());
+        let rest = run(&mut handler, r#"{"cmd":"drain"}"#);
+        assert_eq!(rest["result"]["data_b64"], "EA==");
+        let close = run(&mut handler, r#"{"cmd":"close"}"#);
+        assert_eq!(close["result"]["discarded_bytes"], 0);
+    }
+
+    #[test]
+    fn close_reports_bytes_it_discards() {
+        let mut handler = open_loopback();
+        run(&mut handler, r#"{"cmd":"write","text":"abcdef"}"#);
+        run(&mut handler, r#"{"cmd":"read","bytes":2,"timeout_ms":200}"#);
+        // The loopback hands over everything requested; leave bytes pending
+        // through a match that ends early.
+        run(
+            &mut handler,
+            r#"{"cmd":"expect","pattern":"c","timeout_ms":200}"#,
+        );
+        let close = run(&mut handler, r#"{"cmd":"close"}"#);
+        assert_eq!(close["result"]["discarded_bytes"], 3);
+    }
+
+    #[test]
+    fn read_only_rejects_every_mutation() {
+        let mut handler = CommandHandler::new(Box::new(LoopbackTransport::new()), true);
+        run(&mut handler, r#"{"cmd":"open","port":"loop://"}"#);
+        for line in [
+            r#"{"cmd":"write","text":"x"}"#,
+            r#"{"cmd":"break"}"#,
+            r#"{"cmd":"modem","dtr":true}"#,
+        ] {
+            assert_eq!(
+                run(&mut handler, line)["error"]["code"],
+                "read_only",
+                "{line}"
+            );
+        }
+        assert_eq!(run(&mut handler, r#"{"cmd":"modem"}"#)["ok"], true);
     }
 }

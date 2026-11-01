@@ -1,4 +1,5 @@
-# package.nix builds the bundled Rust crate from Cargo.*, LICENSE and src only;
+# package.nix builds the bundled Rust crate from Cargo.*, LICENSE-*, src,
+# tests and this SKILL.md only;
 # the live target/ directory is deliberately unreachable from the derivation.
 status = "ready"
 agents = ["claude-code", "codex"]

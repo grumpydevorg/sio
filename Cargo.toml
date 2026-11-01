@@ -1,11 +1,12 @@
 [package]
 name = "sio"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.98.0"
 description = "Safe, agent-friendly serial I/O for terminals and automation"
 license = "MIT OR Apache-2.0"
 authors = ["Supersensory Technologies <dev@supersensory.ai>"]
+publish = false
 
 [[bin]]
 name = "sio"
@@ -25,6 +26,14 @@ thiserror = "2"
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
 
 [profile.release]
 lto = true
