@@ -5,13 +5,15 @@ use clap::{Args, Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use sio::protocol::{
     Command, CommandError, End, MAX_LINE_BYTES, OpenParams, Outcome, Payload, ReadSize, Rejected,
-    Request, Response, TimeoutMs, parse_request,
+    Request, RequestId, Response, TimeoutMs, parse_request,
 };
 use sio::server::CommandHandler;
 use sio::transport::{LocalTransport, LoopbackTransport, SerialTransport, list_ports};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
 use std::time::Duration;
 
 const EMBEDDED_SKILL: &str = include_str!("../skills/sio/SKILL.md");
@@ -236,30 +238,63 @@ fn finish_transaction(response: &Response, json_output: bool) -> Result<()> {
     Ok(())
 }
 
+/// A stdin line on its way from the reader thread to the command thread.
+enum Queued {
+    Line(Result<Request, Rejected>),
+    /// A cancel already applied by the reader; answered in queue order.
+    Cancel {
+        id: Option<RequestId>,
+        ticket: u64,
+    },
+}
+
 fn run_stdio(loopback: bool, read_only: bool, fail_fast: bool) -> Result<()> {
     let mut handler = CommandHandler::new(transport(loopback), read_only);
-    let mut reader = BufReader::new(io::stdin().lock());
-    let mut stdout = io::stdout().lock();
-    let mut line = Vec::with_capacity(4096);
-
-    while let Some(too_long) = read_limited_line(&mut reader, &mut line)? {
-        trim_line_ending(&mut line);
-        if line.is_empty() && !too_long {
-            continue;
-        }
-        let response = if too_long {
-            handler.reject(Rejected {
-                id: None,
-                command: "parse",
-                error: CommandError::invalid(format!(
-                    "request line exceeds {MAX_LINE_BYTES} bytes"
-                )),
-            })
-        } else {
-            match parse_request(&line) {
-                Ok(request) => handler.execute(request),
-                Err(rejected) => handler.reject(rejected),
+    let gate = handler.cancel_gate();
+    // Unbounded so the reader never blocks behind queued work: a cancel line
+    // must be read while the request before it is still running.
+    let (sender, queue) = mpsc::channel();
+    let reader = thread::spawn(move || -> io::Result<()> {
+        let mut reader = BufReader::new(io::stdin().lock());
+        let mut line = Vec::with_capacity(4096);
+        while let Some(too_long) = read_limited_line(&mut reader, &mut line)? {
+            trim_line_ending(&mut line);
+            if line.is_empty() && !too_long {
+                continue;
             }
+            let item = if too_long {
+                Queued::Line(Err(Rejected {
+                    id: None,
+                    command: "parse",
+                    error: CommandError::invalid(format!(
+                        "request line exceeds {MAX_LINE_BYTES} bytes"
+                    )),
+                }))
+            } else {
+                match parse_request(&line) {
+                    Ok(Request {
+                        id,
+                        command: Command::Cancel { target },
+                    }) => Queued::Cancel {
+                        ticket: gate.request(target.as_ref()),
+                        id,
+                    },
+                    parsed => Queued::Line(parsed),
+                }
+            };
+            if sender.send(item).is_err() {
+                break; // the command thread stopped (--fail-fast)
+            }
+        }
+        Ok(())
+    });
+
+    let mut stdout = io::stdout().lock();
+    for item in queue {
+        let response = match item {
+            Queued::Line(Ok(request)) => handler.execute(request),
+            Queued::Line(Err(rejected)) => handler.reject(rejected),
+            Queued::Cancel { id, ticket } => handler.finish_cancel(id, ticket),
         };
         serde_json::to_writer(&mut stdout, &response)?;
         stdout.write_all(b"\n")?;
@@ -268,6 +303,9 @@ fn run_stdio(loopback: bool, read_only: bool, fail_fast: bool) -> Result<()> {
             bail!("stdio stopped after an error response");
         }
     }
+    reader
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdin reader panicked"))??;
     Ok(())
 }
 

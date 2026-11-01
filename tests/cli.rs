@@ -196,6 +196,63 @@ fn invalid_commands_are_structured_and_fail_fast_is_nonzero() {
 }
 
 #[test]
+fn stdio_cancel_jumps_queued_work_and_replies_in_order() {
+    use std::io::{BufRead, BufReader};
+    use std::time::{Duration, Instant};
+
+    let mut child = sio()
+        .args(["stdio", "--loopback"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut next = || {
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    stdin
+        .write_all(
+            concat!(
+                "{\"cmd\":\"open\",\"port\":\"loop://\"}\n",
+                "{\"id\":\"a\",\"cmd\":\"expect\",\"pattern\":\"never\",\"timeout_ms\":20000}\n",
+                "{\"id\":\"q\",\"cmd\":\"write\",\"text\":\"x\"}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(next()["command"], "open");
+    // The expect starts right after the open reply; a cancel sent before it
+    // starts would (correctly) find nothing running.
+    std::thread::sleep(Duration::from_millis(300));
+    let start = Instant::now();
+    stdin
+        .write_all(b"{\"id\":\"c\",\"cmd\":\"cancel\",\"target\":\"a\"}\n")
+        .unwrap();
+    drop(stdin);
+    let responses = [next(), next(), next()];
+    assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(child.wait().unwrap().success());
+    let ids: Vec<_> = responses.iter().map(|response| &response["id"]).collect();
+    assert_eq!(ids, ["a", "q", "c"]);
+    assert_eq!(responses[0]["result"]["end"], "cancelled");
+    assert_eq!(responses[1]["ok"], true, "queued write still runs");
+    assert_eq!(responses[2]["result"]["cancelled"], true);
+}
+
+#[test]
+fn an_oversized_payload_is_rejected_with_its_id() {
+    let payload = "A".repeat(1_500_000);
+    let line = format!("{{\"id\":\"big\",\"cmd\":\"write\",\"data_b64\":\"{payload}\"}}\n");
+    let (_, responses, _) = stdio(&["--loopback"], &line);
+    assert_eq!(responses[0]["id"], "big");
+    assert_eq!(responses[0]["command"], "write");
+    assert_eq!(responses[0]["error"]["code"], "invalid_request");
+}
+
+#[test]
 fn invalid_settings_never_reach_a_device() {
     let usage = output(sio().args([
         "transact",

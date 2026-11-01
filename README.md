@@ -32,7 +32,10 @@ Every stdout line is one response object and echoes the request's `id`.
 Diagnostics go to stderr. Received bytes are always returned as Base64 in
 `data_b64`; valid UTF-8 is also included as `text`. Bytes received but not yet
 returned stay buffered for the next read, so nothing is dropped between
-commands. The full protocol is in the embedded skill.
+commands; an `expect` or `readline` that times out leaves its bytes buffered,
+so short waits in a loop are safe. `{"cmd":"cancel","target":"<id>"}` stops a
+running wait within about 100 ms, ahead of queued requests. The full protocol
+is in the embedded skill.
 
 ## With tendr
 
@@ -82,7 +85,9 @@ stdin NDJSON → protocol (parse + validate) → server::CommandHandler → tran
   locked port `port_busy`, and a vanished device closes the port and reports
   `disconnected`. Bytes the operating system still held when the device hung
   up can be lost; `serialport` reports the hang-up before them.
-- A command blocks the session until it returns; timeouts are at most 60 s.
+- `sio stdio` reads stdin on its own thread so a `cancel` can reach a running
+  wait; requests still run one at a time, in order, and replies come in that
+  order. Waits poll in 100 ms slices.
 
 ## Build and check
 

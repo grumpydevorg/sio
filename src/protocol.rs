@@ -21,8 +21,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub const PROTOCOL_VERSION: u8 = 2;
-/// Longest accepted request line, excluding the newline.
-pub const MAX_LINE_BYTES: usize = 64 * 1024;
+/// Longest accepted request line, excluding the newline. Large enough for
+/// every valid request (a 1 MiB payload as escaped text is about 5 MiB), so
+/// an oversized payload is rejected after parsing, with the request's id.
+pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 /// Largest payload, read, or expect window.
 pub const MAX_IO_BYTES: usize = 1024 * 1024;
 /// Longest accepted string request id.
@@ -370,11 +372,18 @@ pub enum Command {
         #[serde(default)]
         duration_ms: BreakMs,
     },
+    /// Stop the running `read`, `readline` or `expect`; with `target`, only
+    /// when that request's id equals `target`.
+    Cancel {
+        #[serde(default)]
+        target: Option<RequestId>,
+    },
 }
 
 impl Command {
-    const NAMES: [&'static str; 10] = [
+    const NAMES: [&'static str; 11] = [
         "list", "open", "close", "write", "read", "readline", "expect", "drain", "modem", "break",
+        "cancel",
     ];
 
     #[must_use]
@@ -390,6 +399,7 @@ impl Command {
             Self::Drain {} => "drain",
             Self::Modem { .. } => "modem",
             Self::Break { .. } => "break",
+            Self::Cancel { .. } => "cancel",
         }
     }
 
@@ -545,6 +555,8 @@ pub enum End {
     BufferLimit,
     /// The device went away; the port is closed.
     Disconnected,
+    /// A `cancel` stopped the wait; nothing was consumed.
+    Cancelled,
 }
 
 #[derive(Debug, Serialize)]
@@ -589,14 +601,20 @@ pub enum Outcome {
         #[serde(flatten)]
         effect: Effect,
     },
+    Cancel {
+        /// The targeted wait was running and ended `cancelled`.
+        cancelled: bool,
+    },
 }
 
-/// Bytes returned (and consumed) by `read`, `readline`, `expect` or `drain`.
+/// Bytes returned by `read`, `readline`, `expect` or `drain`.
 #[derive(Debug)]
 pub struct Received {
     pub data: Vec<u8>,
     pub elapsed: Duration,
     pub end: End,
+    /// False when the bytes stay buffered for the next read-type command.
+    pub consumed: bool,
     /// `Some` for `expect`: the matched byte range within `data`, if any.
     pub expect: Option<Option<Range<usize>>>,
 }
@@ -614,7 +632,7 @@ impl Serialize for Received {
             &u64::try_from(self.elapsed.as_millis()).unwrap_or(u64::MAX),
         )?;
         map.serialize_entry("end", &self.end)?;
-        map.serialize_entry("consumes_input", &true)?;
+        map.serialize_entry("consumes_input", &self.consumed)?;
         if let Some(matched) = &self.expect {
             map.serialize_entry("matched", &matched.is_some())?;
             if let Some(range) = matched {

@@ -77,6 +77,7 @@ stderr. `--fail-fast` exits nonzero after the first error response.
 {"cmd":"modem","dtr":false,"rts":false}
 {"cmd":"break","duration_ms":250}
 {"cmd":"close"}
+{"cmd":"cancel","target":"r7"}
 ```
 
 Use `"serial":"BH00T16X"` instead of `"port"` to open by USB serial number.
@@ -85,7 +86,8 @@ before any hardware is touched.
 
 **Correlation.** Add `"id"` (a string up to 128 bytes, or a non-negative
 integer) to any request; the response echoes it, including when the command is
-invalid. Lines that are not JSON objects get a response without `id`.
+invalid. Lines that are not JSON objects, or longer than 8 MiB, get a response
+without `id`.
 
 **Responses** hold `protocol_version` (2), `id` when given, `session_id`,
 `command`, `ok`, and either `result` or `error` (`code`, `message`,
@@ -101,19 +103,39 @@ invalid. Lines that are not JSON objects get a response without `id`.
 |---|---|
 | `byte_limit` | `read` got the requested count, or a 1 MiB window filled |
 | `idle` | data arrived, then the line went quiet |
-| `timeout` | the timeout elapsed; any partial data is returned |
+| `timeout` | the timeout elapsed; see below for what is consumed |
 | `newline` | `readline` returned one line including `\n` |
 | `match` | `expect` returned everything up to the end of the match |
 | `buffer_limit` | `expect` received 1 MiB without a match; all of it is returned |
 | `disconnected` | the device went away; the port is closed; reopen it |
+| `cancelled` | a `cancel` stopped the wait; nothing is consumed |
 
-Bytes received but not yet returned stay buffered for the next read-type
-command, so `expect` followed by `readline` sees the bytes after the match.
-`expect` adds `matched`, and `matched_b64`/`matched_text` when it matched.
-`close` reports `discarded_bytes` still buffered.
+Results carry `consumes_input`. When it is `false`, the bytes shown stay
+buffered: an `expect` or `readline` that times out, and any cancelled wait,
+leave them for the next read-type command, so a pattern or line split across
+two waits is still found. Everything else consumes what it returns. Bytes
+after a match or newline stay buffered too, so `expect` followed by
+`readline` sees them. `expect` adds `matched`, and `matched_b64`/`matched_text`
+when it matched. `close` reports `discarded_bytes` still buffered.
 
-Limits: request line 64 KiB; payload, read, and expect window 1 MiB; timeouts
-1–60000 ms; break 1–10000 ms. A command blocks the session until it returns.
+**Waiting and cancelling.** Requests run one at a time, in order. Prefer
+short waits (2–5 s) in a loop over one long wait. To stop a running `read`,
+`readline`, or `expect`, send `{"cmd":"cancel","target":"<its id>"}`:
+
+- `cancel` skips the queue: sio acts on it as soon as the line arrives and
+  stops the targeted wait within about 100 ms. Queued requests still run,
+  in order; `write` and `break` are never stopped.
+- It affects only a wait that is running when the cancel arrives, never a
+  queued or later one. If the wait already finished, or another request is
+  running, the reply is `"cancelled":false` and nothing changes.
+- `{"cmd":"cancel"}` without `target` stops whatever wait is running. Use it
+  only when you are the session's sole caller; with another caller it can
+  stop their request.
+- The cancel's own reply comes in queue order, after the replies to
+  requests sent before it.
+
+Limits: request line 8 MiB; payload, read, and expect window 1 MiB; timeouts
+1–60000 ms; break 1–10000 ms.
 
 ## Keep a session alive with tendr
 
@@ -134,10 +156,15 @@ tendr kill serial
 ```
 
 `exec` exits 0 for `"ok":true`, 1 for an error response, 124 when tendr stops
-waiting. Give `tendr exec --timeout` more than the request's `timeout_ms`.
-Without that target, use `printf '%s\n' '{"id":"r1",…}' | tendr push serial`
-and find the response with `"id":"r1"` in `tendr log serial`. For a human
-console that an agent can also drive, use
+waiting. Give `tendr exec --timeout` more than the request's `timeout_ms`, or
+better, keep `timeout_ms` short and loop. If an exec does time out, its request
+may still be running: stop it with
+`tendr exec serial -- '{"cmd":"cancel","target":"<request_id>"}'`, using the
+`request_id` tendr reports for the timed-out exec (tendr releases after
+0.4.1). The stopped request's reply then appears in that exec's `unmatched`.
+Without the ndjson target, use `printf '%s\n' '{"id":"r1",…}' | tendr push
+serial` and find the response with `"id":"r1"` in `tendr log serial`. For a
+human console that an agent can also drive, use
 `tendr start --pty con -- sio terminal …` with `tendr attach con` and
 `tendr push con`; tendr's log keeps a timestamped capture.
 

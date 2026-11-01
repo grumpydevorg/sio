@@ -2,7 +2,8 @@
 //!
 //! Received bytes that a command has not returned yet stay in one pending
 //! buffer, so every read-type command sees them in arrival order and a
-//! transport error never discards data.
+//! transport error never discards data. A `read`, `readline` or `expect` that
+//! times out or is cancelled leaves its bytes buffered.
 
 use crate::protocol::{
     Command, CommandError, End, ErrorCode, MAX_IO_BYTES, Outcome, Received, Rejected, Request,
@@ -11,11 +12,12 @@ use crate::protocol::{
 use crate::transport::{SerialTransport, TransportError, list_ports};
 use regex::bytes::Regex;
 use std::ops::Range;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// Longest wait between pattern checks during `expect`.
-const EXPECT_POLL: Duration = Duration::from_millis(100);
+/// Longest single wait inside `read`, `readline` and `expect`; bounds how
+/// long a cancel takes to stop them.
+const WAIT_SLICE: Duration = Duration::from_millis(100);
 /// How long `drain` waits for bytes already in flight.
 const DRAIN_WAIT: Duration = Duration::from_millis(50);
 /// Largest single transport read.
@@ -30,6 +32,7 @@ pub struct CommandHandler {
     pending: Vec<u8>,
     read_only: bool,
     session_id: Arc<str>,
+    gate: Arc<CancelGate>,
 }
 
 impl CommandHandler {
@@ -43,13 +46,41 @@ impl CommandHandler {
             pending: Vec::new(),
             read_only,
             session_id: format!("{}-{epoch_nanos}", std::process::id()).into(),
+            gate: Arc::default(),
         }
+    }
+
+    /// The gate a concurrent stdin reader uses to cancel running waits.
+    #[must_use]
+    pub fn cancel_gate(&self) -> Arc<CancelGate> {
+        Arc::clone(&self.gate)
     }
 
     pub fn execute(&mut self, request: Request) -> Response {
         let command = request.command.name();
-        let outcome = self.run(request.command);
+        let outcome = if matches!(
+            request.command,
+            Command::Read { .. } | Command::Readline { .. } | Command::Expect { .. }
+        ) {
+            self.gate.begin(request.id.clone());
+            let outcome = self.run(request.command);
+            self.gate.end(matches!(
+                &outcome,
+                Ok(Outcome::Received(received)) if received.end == End::Cancelled
+            ));
+            outcome
+        } else {
+            self.run(request.command)
+        };
         self.respond(request.id, command, outcome)
+    }
+
+    /// Answer a `cancel` whose [`CancelGate::request`] ticket was taken when
+    /// its line arrived.
+    #[must_use]
+    pub fn finish_cancel(&self, id: Option<RequestId>, ticket: u64) -> Response {
+        let cancelled = self.gate.fired(ticket);
+        self.respond(id, "cancel", Ok(Outcome::Cancel { cancelled }))
     }
 
     /// Answer a request line that failed to parse.
@@ -154,6 +185,13 @@ impl CommandHandler {
                     effect: SideEffect::SerialBreakSent.into(),
                 })
             }
+            // Reached only without a concurrent reader, so no wait is running.
+            Command::Cancel { target } => {
+                let ticket = self.gate.request(target.as_ref());
+                Ok(Outcome::Cancel {
+                    cancelled: self.gate.fired(ticket),
+                })
+            }
         }
     }
 
@@ -170,10 +208,14 @@ impl CommandHandler {
     }
 
     /// Receive into `pending`, leaving room for at most `limit` buffered bytes.
+    /// Waits at most [`WAIT_SLICE`] so a cancel is noticed promptly.
     /// `Ok(false)` means the device disconnected.
     fn receive(&mut self, limit: usize, wait: Duration) -> Result<bool, CommandError> {
         let room = limit.saturating_sub(self.pending.len()).min(CHUNK);
-        match self.transport.read_into(&mut self.pending, room, wait) {
+        match self
+            .transport
+            .read_into(&mut self.pending, room, wait.min(WAIT_SLICE))
+        {
             Ok(()) => Ok(true),
             Err(TransportError::Disconnected) => Ok(false),
             Err(error) => Err(CommandError::from_transport(&error, false)),
@@ -187,6 +229,18 @@ impl CommandHandler {
             data: std::mem::replace(&mut self.pending, rest),
             elapsed: start.elapsed(),
             end,
+            consumed: true,
+            expect: None,
+        }
+    }
+
+    /// Report the pending bytes without consuming them.
+    fn peek(&self, start: Instant, end: End) -> Received {
+        Received {
+            data: self.pending.clone(),
+            elapsed: start.elapsed(),
+            end,
+            consumed: false,
             expect: None,
         }
     }
@@ -198,6 +252,9 @@ impl CommandHandler {
             if self.pending.len() >= bytes {
                 break End::ByteLimit;
             }
+            if self.gate.requested() {
+                return Ok(Outcome::Received(self.peek(start, End::Cancelled)));
+            }
             let remaining = timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
                 break if self.pending.is_empty() {
@@ -207,7 +264,7 @@ impl CommandHandler {
                 };
             }
             let before = self.pending.len();
-            // Wait the full timeout only for the first byte.
+            // Once data has arrived, a short silence ends the read.
             let wait = if before == 0 {
                 remaining
             } else {
@@ -236,9 +293,13 @@ impl CommandHandler {
             if self.pending.len() >= MAX_IO_BYTES {
                 break End::ByteLimit;
             }
+            if self.gate.requested() {
+                return Ok(Outcome::Received(self.peek(start, End::Cancelled)));
+            }
             let remaining = timeout.saturating_sub(start.elapsed());
             if remaining.is_zero() {
-                break End::Timeout;
+                // A partial line stays buffered for the next readline.
+                return Ok(Outcome::Received(self.peek(start, End::Timeout)));
             }
             if !self.receive(MAX_IO_BYTES, remaining)? {
                 break End::Disconnected;
@@ -265,11 +326,21 @@ impl CommandHandler {
             if self.pending.len() >= MAX_IO_BYTES {
                 break (MAX_IO_BYTES, End::BufferLimit, None);
             }
-            let remaining = timeout.saturating_sub(start.elapsed());
-            if remaining.is_zero() {
-                break (MAX_IO_BYTES, End::Timeout, None);
+            let unfinished = if self.gate.requested() {
+                Some(End::Cancelled)
+            } else if timeout.saturating_sub(start.elapsed()).is_zero() {
+                Some(End::Timeout)
+            } else {
+                None
+            };
+            if let Some(end) = unfinished {
+                // Keep the bytes: a pattern split across two waits still matches.
+                let mut received = self.peek(start, end);
+                received.expect = Some(None);
+                return Ok(Outcome::Received(received));
             }
-            if !self.receive(MAX_IO_BYTES, remaining.min(EXPECT_POLL))? {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            if !self.receive(MAX_IO_BYTES, remaining)? {
                 if let Some(found) = regex.find(&self.pending) {
                     let range = found.range();
                     break (range.end, End::Match, Some(range));
@@ -299,6 +370,87 @@ impl CommandHandler {
             end = End::ByteLimit;
         }
         Ok(Outcome::Received(self.take(MAX_IO_BYTES, start, end)))
+    }
+}
+
+/// Lets a `cancel` request, read while another request is running, stop
+/// that request's wait.
+///
+/// The stdin reader calls [`CancelGate::request`] the moment a cancel line
+/// arrives; the command thread checks [`CancelGate::requested`] between
+/// receive slices and answers the cancel, in queue order, with
+/// [`CommandHandler::finish_cancel`].
+#[derive(Debug, Default)]
+pub struct CancelGate(Mutex<GateState>);
+
+#[derive(Debug, Default)]
+struct GateState {
+    running: Option<RunningWait>,
+    next_ticket: u64,
+    /// Tickets whose wait ended `cancelled`, not yet answered.
+    fired: Vec<u64>,
+}
+
+#[derive(Debug)]
+struct RunningWait {
+    id: Option<RequestId>,
+    ticket: Option<u64>,
+}
+
+impl CancelGate {
+    fn state(&self) -> MutexGuard<'_, GateState> {
+        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Ask the running wait to stop: any wait without `target`, otherwise
+    /// only the wait whose request id equals `target`. A wait that is not
+    /// running yet is never affected. Returns the ticket that
+    /// [`CommandHandler::finish_cancel`] later reports on.
+    pub fn request(&self, target: Option<&RequestId>) -> u64 {
+        let mut state = self.state();
+        let ticket = state.next_ticket;
+        state.next_ticket += 1;
+        if let Some(wait) = &mut state.running
+            && wait.ticket.is_none()
+            && target.is_none_or(|target| wait.id.as_ref() == Some(target))
+        {
+            wait.ticket = Some(ticket);
+        }
+        ticket
+    }
+
+    fn begin(&self, id: Option<RequestId>) {
+        self.state().running = Some(RunningWait { id, ticket: None });
+    }
+
+    fn requested(&self) -> bool {
+        self.state()
+            .running
+            .as_ref()
+            .is_some_and(|wait| wait.ticket.is_some())
+    }
+
+    fn end(&self, cancelled: bool) {
+        let mut state = self.state();
+        if let Some(RunningWait {
+            ticket: Some(ticket),
+            ..
+        }) = state.running.take()
+            && cancelled
+        {
+            state.fired.push(ticket);
+        }
+    }
+
+    fn fired(&self, ticket: u64) -> bool {
+        let mut state = self.state();
+        match state.fired.iter().position(|fired| *fired == ticket) {
+            Some(index) => {
+                state.fired.swap_remove(index);
+                true
+            }
+            None => false,
+        }
     }
 }
 
@@ -433,5 +585,119 @@ mod tests {
             );
         }
         assert_eq!(run(&mut handler, r#"{"cmd":"modem"}"#)["ok"], true);
+    }
+
+    #[test]
+    fn a_pattern_split_across_timed_out_expects_still_matches() {
+        let mut handler = open_loopback();
+        run(&mut handler, r#"{"cmd":"write","text":"log: ZZ"}"#);
+        let early = run(
+            &mut handler,
+            r#"{"cmd":"expect","pattern":"ZZZ","timeout_ms":150}"#,
+        );
+        assert_eq!(early["result"]["end"], "timeout");
+        assert_eq!(early["result"]["consumes_input"], false);
+        assert_eq!(early["result"]["text"], "log: ZZ");
+        run(&mut handler, r#"{"cmd":"write","text":"Z!"}"#);
+        let matched = run(
+            &mut handler,
+            r#"{"cmd":"expect","pattern":"ZZZ","timeout_ms":500}"#,
+        );
+        assert_eq!(matched["result"]["end"], "match");
+        assert_eq!(matched["result"]["consumes_input"], true);
+        assert_eq!(matched["result"]["text"], "log: ZZZ");
+        let rest = run(&mut handler, r#"{"cmd":"drain"}"#);
+        assert_eq!(rest["result"]["text"], "!");
+    }
+
+    #[test]
+    fn a_partial_line_survives_a_readline_timeout() {
+        let mut handler = open_loopback();
+        run(&mut handler, r#"{"cmd":"write","text":"hal"}"#);
+        let early = run(&mut handler, r#"{"cmd":"readline","timeout_ms":150}"#);
+        assert_eq!(early["result"]["end"], "timeout");
+        assert_eq!(early["result"]["consumes_input"], false);
+        run(&mut handler, r#"{"cmd":"write","text":"f\n"}"#);
+        let line = run(&mut handler, r#"{"cmd":"readline","timeout_ms":500}"#);
+        assert_eq!(line["result"]["text"], "half\n");
+    }
+
+    /// Run `line` while another thread sends a cancel for `target` after
+    /// 200 ms; returns the request's response, the cancel's response, and
+    /// how long the request took.
+    fn cancel_during(
+        handler: &mut CommandHandler,
+        line: &str,
+        target: Option<&str>,
+    ) -> (Value, Value, Duration) {
+        let gate = handler.cancel_gate();
+        let target = target.map(|id| RequestId::Text(id.to_owned()));
+        let canceller = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            gate.request(target.as_ref())
+        });
+        let start = Instant::now();
+        let response = run(handler, line);
+        let elapsed = start.elapsed();
+        let ticket = canceller.join().unwrap();
+        let cancel = serde_json::to_value(handler.finish_cancel(None, ticket)).unwrap();
+        (response, cancel, elapsed)
+    }
+
+    #[test]
+    fn targeted_cancel_stops_its_wait_and_keeps_the_bytes() {
+        let mut handler = open_loopback();
+        run(&mut handler, r#"{"cmd":"write","text":"booting"}"#);
+        let (expect, cancel, elapsed) = cancel_during(
+            &mut handler,
+            r#"{"id":"a","cmd":"expect","pattern":"login:","timeout_ms":10000}"#,
+            Some("a"),
+        );
+        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+        assert_eq!(expect["id"], "a");
+        assert_eq!(expect["result"]["end"], "cancelled");
+        assert_eq!(expect["result"]["consumes_input"], false);
+        assert_eq!(cancel["result"]["cancelled"], true);
+        let rest = run(&mut handler, r#"{"cmd":"drain"}"#);
+        assert_eq!(rest["result"]["text"], "booting");
+    }
+
+    #[test]
+    fn untargeted_cancel_stops_any_running_wait() {
+        let mut handler = open_loopback();
+        let (read, cancel, elapsed) = cancel_during(
+            &mut handler,
+            r#"{"cmd":"read","bytes":10,"timeout_ms":10000}"#,
+            None,
+        );
+        assert!(elapsed < Duration::from_secs(1), "took {elapsed:?}");
+        assert_eq!(read["result"]["end"], "cancelled");
+        assert_eq!(cancel["result"]["cancelled"], true);
+    }
+
+    #[test]
+    fn cancel_for_another_request_leaves_the_running_wait_alone() {
+        // A timed out and finished; B is running when A's cancel arrives.
+        let mut handler = open_loopback();
+        let (b, cancel, elapsed) = cancel_during(
+            &mut handler,
+            r#"{"id":"b","cmd":"readline","timeout_ms":600}"#,
+            Some("a"),
+        );
+        assert!(elapsed >= Duration::from_millis(600), "took {elapsed:?}");
+        assert_eq!(b["result"]["end"], "timeout");
+        assert_eq!(cancel["result"]["cancelled"], false);
+    }
+
+    #[test]
+    fn cancel_with_nothing_running_reports_false() {
+        let mut handler = open_loopback();
+        let cancel = run(&mut handler, r#"{"cmd":"cancel"}"#);
+        assert_eq!(cancel["result"]["cancelled"], false);
+        // It is not armed for the next wait either.
+        let start = Instant::now();
+        let line = run(&mut handler, r#"{"cmd":"readline","timeout_ms":300}"#);
+        assert_eq!(line["result"]["end"], "timeout");
+        assert!(start.elapsed() >= Duration::from_millis(300));
     }
 }
