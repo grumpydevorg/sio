@@ -1,0 +1,32 @@
+[package]
+name = "sio"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.85"
+description = "Safe, agent-friendly serial I/O for terminals and automation"
+license = "MIT OR Apache-2.0"
+authors = ["Supersensory Technologies <dev@supersensory.ai>"]
+
+[[bin]]
+name = "sio"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serialport = "4.8"
+thiserror = "2"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
