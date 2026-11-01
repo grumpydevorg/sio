@@ -41,7 +41,8 @@ is in the embedded skill.
 
 [tendr](https://github.com/grumpydevorg/tendr) keeps `sio stdio` running
 between an agent's tool calls, locally or with `--host`. A tendr with the
-`ndjson` exec target (`tendr guide ndjson`) sends one request per `tendr exec`
+`ndjson` exec target (releases after 0.4.1; `tendr guide ndjson`) sends one
+request per `tendr exec`
 and returns the reply that carries the request's id, so a reply that arrives
 after a client timeout is never mistaken for the next request's reply:
 

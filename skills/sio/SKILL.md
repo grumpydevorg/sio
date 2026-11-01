@@ -142,9 +142,10 @@ Limits: request line 8 MiB; payload, read, and expect window 1 MiB; timeouts
 A shell tool call ends its processes, so a plain `sio stdio` dies between
 calls. Run it under tendr instead.
 
-With a tendr that has the `ndjson` exec target (`tendr guide ndjson`), `exec`
-sends one request and returns the reply carrying its own id; replies to an
-earlier timed-out exec appear in `unmatched`, never as your reply:
+With a tendr that has the `ndjson` exec target (releases after 0.4.1; check
+with `tendr guide ndjson`), `exec` sends one request and returns the reply
+carrying its own id; replies to an earlier timed-out exec appear in
+`unmatched`, never as your reply:
 
 ```bash
 tendr start --stdin --exec-target ndjson serial -- sio stdio --read-only
@@ -160,9 +161,10 @@ waiting. Give `tendr exec --timeout` more than the request's `timeout_ms`, or
 better, keep `timeout_ms` short and loop. If an exec does time out, its request
 may still be running: stop it with
 `tendr exec serial -- '{"cmd":"cancel","target":"<request_id>"}'`, using the
-`request_id` tendr reports for the timed-out exec (tendr releases after
+`request_id` tendr reports for the timed-out exec (also tendr releases after
 0.4.1). The stopped request's reply then appears in that exec's `unmatched`.
-Without the ndjson target, use `printf '%s\n' '{"id":"r1",…}' | tendr push
+Without the ndjson target (tendr 0.4.1 and earlier), use
+`printf '%s\n' '{"id":"r1",…}' | tendr push
 serial` and find the response with `"id":"r1"` in `tendr log serial`. For a
 human console that an agent can also drive, use
 `tendr start --pty con -- sio terminal …` with `tendr attach con` and
