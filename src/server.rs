@@ -56,6 +56,12 @@ impl CommandHandler {
         Arc::clone(&self.gate)
     }
 
+    /// This session's id, for responses written outside the command thread.
+    #[must_use]
+    pub fn session_id(&self) -> Arc<str> {
+        Arc::clone(&self.session_id)
+    }
+
     pub fn execute(&mut self, request: Request) -> Response {
         let command = request.command.name();
         let outcome = if matches!(
@@ -187,10 +193,11 @@ impl CommandHandler {
             }
             // Reached only without a concurrent reader, so no wait is running.
             Command::Cancel { target } => {
-                let ticket = self.gate.request(target.as_ref());
-                Ok(Outcome::Cancel {
-                    cancelled: self.gate.fired(ticket),
-                })
+                let cancelled = self
+                    .gate
+                    .request(target.as_ref())
+                    .is_some_and(|ticket| self.gate.fired(ticket));
+                Ok(Outcome::Cancel { cancelled })
             }
         }
     }
@@ -377,9 +384,9 @@ impl CommandHandler {
 /// that request's wait.
 ///
 /// The stdin reader calls [`CancelGate::request`] the moment a cancel line
-/// arrives; the command thread checks [`CancelGate::requested`] between
-/// receive slices and answers the cancel, in queue order, with
-/// [`CommandHandler::finish_cancel`].
+/// arrives. A cancel that misses is answered `cancelled: false` at once with
+/// [`missed_cancel`]; one that reaches the running wait is answered, in queue
+/// order after that wait's reply, by [`CommandHandler::finish_cancel`].
 #[derive(Debug, Default)]
 pub struct CancelGate(Mutex<GateState>);
 
@@ -404,19 +411,22 @@ impl CancelGate {
 
     /// Ask the running wait to stop: any wait without `target`, otherwise
     /// only the wait whose request id equals `target`. A wait that is not
-    /// running yet is never affected. Returns the ticket that
-    /// [`CommandHandler::finish_cancel`] later reports on.
-    pub fn request(&self, target: Option<&RequestId>) -> u64 {
+    /// running yet, or that an earlier cancel already reached, is never
+    /// affected. Returns the ticket [`CommandHandler::finish_cancel`] reports
+    /// on, or `None` when the cancel missed and can be answered `false` now.
+    pub fn request(&self, target: Option<&RequestId>) -> Option<u64> {
         let mut state = self.state();
         let ticket = state.next_ticket;
-        state.next_ticket += 1;
         if let Some(wait) = &mut state.running
             && wait.ticket.is_none()
             && target.is_none_or(|target| wait.id.as_ref() == Some(target))
         {
             wait.ticket = Some(ticket);
+            state.next_ticket += 1;
+            Some(ticket)
+        } else {
+            None
         }
-        ticket
     }
 
     fn begin(&self, id: Option<RequestId>) {
@@ -451,6 +461,18 @@ impl CancelGate {
             }
             None => false,
         }
+    }
+}
+
+/// The reply to a `cancel` that reached no running wait. Built outside the
+/// command thread so it does not wait behind the running request.
+#[must_use]
+pub fn missed_cancel(session_id: Arc<str>, id: Option<RequestId>) -> Response {
+    Response {
+        id,
+        session_id,
+        command: "cancel",
+        outcome: Ok(Outcome::Cancel { cancelled: false }),
     }
 }
 
@@ -639,8 +661,11 @@ mod tests {
         let start = Instant::now();
         let response = run(handler, line);
         let elapsed = start.elapsed();
-        let ticket = canceller.join().unwrap();
-        let cancel = serde_json::to_value(handler.finish_cancel(None, ticket)).unwrap();
+        let cancel = match canceller.join().unwrap() {
+            Some(ticket) => handler.finish_cancel(None, ticket),
+            None => missed_cancel(handler.session_id(), None),
+        };
+        let cancel = serde_json::to_value(cancel).unwrap();
         (response, cancel, elapsed)
     }
 

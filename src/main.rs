@@ -8,7 +8,7 @@ use sio::protocol::{
     OpenParams, Outcome, Payload, ReadSize, Rejected, Request, RequestId, Response, TimeoutMs,
     parse_request,
 };
-use sio::server::CommandHandler;
+use sio::server::{CommandHandler, missed_cancel};
 use sio::transport::{LocalTransport, LoopbackTransport, SerialTransport, list_ports};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
@@ -256,6 +256,7 @@ enum Queued {
 fn run_stdio(loopback: bool, read_only: bool, fail_fast: bool) -> Result<()> {
     let mut handler = CommandHandler::new(transport(loopback), read_only);
     let gate = handler.cancel_gate();
+    let session_id = handler.session_id();
     let queued_bytes = Arc::new(AtomicUsize::new(0));
     // The reader keeps reading while a request runs, so a cancel line reaches
     // the running wait. Memory stays bounded: requests over the byte budget
@@ -284,10 +285,14 @@ fn run_stdio(loopback: bool, read_only: bool, fail_fast: bool) -> Result<()> {
                     Ok(Request {
                         id,
                         command: Command::Cancel { target },
-                    }) => Queued::Cancel {
-                        ticket: gate.request(target.as_ref()),
-                        id,
-                    },
+                    }) => {
+                        let Some(ticket) = gate.request(target.as_ref()) else {
+                            // Nothing to stop: answer now, ahead of the queue.
+                            write_response(&missed_cancel(Arc::clone(&session_id), id))?;
+                            continue;
+                        };
+                        Queued::Cancel { id, ticket }
+                    }
                     Ok(request) => admit(request, line.len(), &reader_bytes),
                     Err(rejected) => Queued::Rejected(rejected),
                 }
@@ -299,7 +304,6 @@ fn run_stdio(loopback: bool, read_only: bool, fail_fast: bool) -> Result<()> {
         Ok(())
     });
 
-    let mut stdout = io::stdout().lock();
     for item in queue {
         let response = match item {
             Queued::Request(request, cost) => {
@@ -310,9 +314,7 @@ fn run_stdio(loopback: bool, read_only: bool, fail_fast: bool) -> Result<()> {
             Queued::Rejected(rejected) => handler.reject(rejected),
             Queued::Cancel { id, ticket } => handler.finish_cancel(id, ticket),
         };
-        serde_json::to_writer(&mut stdout, &response)?;
-        stdout.write_all(b"\n")?;
-        stdout.flush()?;
+        write_response(&response)?;
         if fail_fast && !response.is_ok() {
             bail!("stdio stopped after an error response");
         }
@@ -321,6 +323,15 @@ fn run_stdio(loopback: bool, read_only: bool, fail_fast: bool) -> Result<()> {
         .join()
         .map_err(|_| anyhow::anyhow!("stdin reader panicked"))??;
     Ok(())
+}
+
+/// Write one response line. Both stdio threads write; holding the stdout
+/// lock for the whole line keeps lines whole.
+fn write_response(response: &Response) -> io::Result<()> {
+    let mut stdout = io::stdout().lock();
+    serde_json::to_writer(&mut stdout, response)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()
 }
 
 /// Queue `request` if its line fits the byte budget, otherwise answer it

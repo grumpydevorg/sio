@@ -243,6 +243,58 @@ fn stdio_cancel_jumps_queued_work_and_replies_in_order() {
 }
 
 #[test]
+fn a_cancel_that_misses_is_answered_at_once() {
+    use std::io::{BufRead, BufReader};
+    use std::time::{Duration, Instant};
+
+    let mut child = sio()
+        .args(["stdio", "--loopback"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut next = || {
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    stdin
+        .write_all(
+            concat!(
+                "{\"cmd\":\"open\",\"port\":\"loop://\"}\n",
+                "{\"id\":\"b\",\"cmd\":\"readline\",\"timeout_ms\":3000}\n",
+                "{\"id\":\"q\",\"cmd\":\"write\",\"text\":\"x\"}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(next()["command"], "open");
+    std::thread::sleep(Duration::from_millis(200));
+    let start = Instant::now();
+    stdin
+        .write_all(b"{\"id\":\"c\",\"cmd\":\"cancel\",\"target\":\"a\"}\n")
+        .unwrap();
+    // The cancel targets a request that is not running: its reply overtakes
+    // the running readline and the queued write.
+    let cancel = next();
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+    assert_eq!(cancel["id"], "c");
+    assert_eq!(cancel["result"]["cancelled"], false);
+    drop(stdin);
+    let running = next();
+    assert_eq!(running["id"], "b");
+    assert_eq!(running["result"]["end"], "timeout", "b was left alone");
+    assert_eq!(next()["id"], "q");
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
 fn a_flood_behind_a_running_wait_is_bounded_and_cancel_still_lands() {
     use base64::Engine;
     use std::io::{BufRead, BufReader};

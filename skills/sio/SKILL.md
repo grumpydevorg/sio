@@ -127,12 +127,15 @@ short waits (2–5 s) in a loop over one long wait. To stop a running `read`,
   in order; `write` and `break` are never stopped.
 - It affects only a wait that is running when the cancel arrives, never a
   queued or later one. If the wait already finished, or another request is
-  running, the reply is `"cancelled":false` and nothing changes.
+  running, the reply is `"cancelled":false`, sent at once, and nothing
+  changes.
 - `{"cmd":"cancel"}` without `target` stops whatever wait is running. Use it
   only when you are the session's sole caller; with another caller it can
   stop their request.
-- The cancel's own reply comes in queue order, after the replies to
-  requests sent before it.
+- Reply order: a cancel that stopped a wait replies right after that wait's
+  `cancelled` reply. A cancel that missed replies immediately, ahead of the
+  running and queued requests' replies. Every other reply comes in request
+  order, so match replies by `id`.
 
 Limits: request line 8 MiB; payload, read, and expect window 1 MiB; timeouts
 1–60000 ms; break 1–10000 ms; error messages 512 bytes (longer ones end in
