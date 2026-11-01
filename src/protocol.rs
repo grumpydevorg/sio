@@ -35,6 +35,8 @@ pub const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
 /// Most requests `sio stdio` holds queued, including `queue_full` answers.
 /// Beyond it, stdin is not read until the queue drains.
 pub const MAX_QUEUED_REQUESTS: usize = 1024;
+/// Longest error message, in bytes before the trailing ellipsis.
+pub const MAX_ERROR_MESSAGE_BYTES: usize = 512;
 
 macro_rules! bounded_u64 {
     ($(#[$meta:meta])* $name:ident, $min:expr, $max:expr, $default:expr, $message:literal) => {
@@ -701,9 +703,17 @@ pub struct CommandError {
 impl CommandError {
     #[must_use]
     pub fn new(code: ErrorCode, message: impl Into<String>, retryable: bool) -> Self {
+        let mut message = message.into();
+        // Messages can quote request text (an unknown field or command name),
+        // so a malformed line must not produce a reply as large as itself.
+        if message.len() > MAX_ERROR_MESSAGE_BYTES {
+            // A fresh string: truncating in place would keep the capacity.
+            let end = message.floor_char_boundary(MAX_ERROR_MESSAGE_BYTES);
+            message = format!("{}…", &message[..end]);
+        }
         Self {
             code,
-            message: message.into(),
+            message,
             retryable,
         }
     }
@@ -752,6 +762,20 @@ mod tests {
                 .message
                 .contains("bits must be 5, 6, 7, or 8")
         );
+    }
+
+    #[test]
+    fn errors_quoting_huge_names_stay_small_and_valid_utf8() {
+        let name = "é".repeat(100_000);
+        for line in [
+            format!(r#"{{"id":"x","cmd":"{name}"}}"#),
+            format!(r#"{{"id":"x","cmd":"close","{name}":1}}"#),
+        ] {
+            let rejection = rejected(&line);
+            assert_eq!(rejection.id, Some(RequestId::Text("x".into())));
+            assert!(rejection.error.message.len() <= MAX_ERROR_MESSAGE_BYTES + "…".len());
+            assert!(rejection.error.message.ends_with('…'));
+        }
     }
 
     #[test]

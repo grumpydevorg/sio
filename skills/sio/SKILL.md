@@ -135,7 +135,8 @@ short waits (2–5 s) in a loop over one long wait. To stop a running `read`,
   requests sent before it.
 
 Limits: request line 8 MiB; payload, read, and expect window 1 MiB; timeouts
-1–60000 ms; break 1–10000 ms. Behind a running request, sio queues at most
+1–60000 ms; break 1–10000 ms; error messages 512 bytes (longer ones end in
+`…`). Behind a running request, sio queues at most
 16 MiB of request lines; a request beyond that is answered at once with
 `queue_full` (`retryable: true`, nothing was done) in its place in the reply
 order. With 1024 requests already queued, sio stops reading stdin until the

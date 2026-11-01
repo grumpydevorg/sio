@@ -312,6 +312,63 @@ fn a_flood_behind_a_running_wait_is_bounded_and_cancel_still_lands() {
 }
 
 #[test]
+fn a_flood_of_malformed_lines_behind_a_wait_gets_small_replies() {
+    use std::io::{BufRead, BufReader};
+
+    // Unknown command and field names near 1 MiB each: their serde errors
+    // quote the name, so uncapped replies would be as large as the input.
+    let name = "n".repeat(1024 * 1024);
+    let mut child = sio()
+        .args(["stdio", "--loopback"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut next = || {
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        line
+    };
+    stdin
+        .write_all(
+            concat!(
+                "{\"cmd\":\"open\",\"port\":\"loop://\"}\n",
+                "{\"id\":\"wait\",\"cmd\":\"expect\",\"pattern\":\"never\",\"timeout_ms\":30000}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    assert!(next().contains("\"open\""));
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    for index in 0..30 {
+        if index % 2 == 0 {
+            writeln!(stdin, r#"{{"id":{index},"cmd":"{name}"}}"#).unwrap();
+        } else {
+            writeln!(stdin, r#"{{"id":{index},"cmd":"close","{name}":1}}"#).unwrap();
+        }
+    }
+    stdin
+        .write_all(b"{\"cmd\":\"cancel\",\"target\":\"wait\"}\n")
+        .unwrap();
+    drop(stdin);
+
+    let waited: Value = serde_json::from_str(&next()).unwrap();
+    assert_eq!(waited["result"]["end"], "cancelled");
+    for index in 0..30 {
+        let line = next();
+        assert!(line.len() < 2048, "reply {index} is {} bytes", line.len());
+        let reply: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(reply["id"], index);
+        assert_eq!(reply["error"]["code"], "invalid_request");
+    }
+    let cancel: Value = serde_json::from_str(&next()).unwrap();
+    assert_eq!(cancel["result"]["cancelled"], true);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
 fn an_oversized_payload_is_rejected_with_its_id() {
     let payload = "A".repeat(1_500_000);
     let line = format!("{{\"id\":\"big\",\"cmd\":\"write\",\"data_b64\":\"{payload}\"}}\n");
