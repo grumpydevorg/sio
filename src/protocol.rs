@@ -29,6 +29,12 @@ pub const MAX_LINE_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_IO_BYTES: usize = 1024 * 1024;
 /// Longest accepted string request id.
 pub const MAX_ID_BYTES: usize = 128;
+/// Most request-line bytes `sio stdio` holds queued behind a running request.
+/// A request that would exceed it is answered `queue_full` instead of queued.
+pub const MAX_QUEUED_BYTES: usize = 16 * 1024 * 1024;
+/// Most requests `sio stdio` holds queued, including `queue_full` answers.
+/// Beyond it, stdin is not read until the queue drains.
+pub const MAX_QUEUED_REQUESTS: usize = 1024;
 
 macro_rules! bounded_u64 {
     ($(#[$meta:meta])* $name:ident, $min:expr, $max:expr, $default:expr, $message:literal) => {
@@ -660,6 +666,7 @@ pub enum ErrorCode {
     PermissionDenied,
     Disconnected,
     Transport,
+    QueueFull,
 }
 
 impl ErrorCode {
@@ -676,6 +683,7 @@ impl ErrorCode {
             Self::PermissionDenied => "permission_denied",
             Self::Disconnected => "disconnected",
             Self::Transport => "transport",
+            Self::QueueFull => "queue_full",
         }
     }
 }

@@ -243,6 +243,75 @@ fn stdio_cancel_jumps_queued_work_and_replies_in_order() {
 }
 
 #[test]
+fn a_flood_behind_a_running_wait_is_bounded_and_cancel_still_lands() {
+    use base64::Engine;
+    use std::io::{BufRead, BufReader};
+
+    // 40 writes of 1 MiB each: ~56 MiB of request lines, far over the
+    // 16 MiB queue budget, sent while an expect is waiting.
+    let payload = base64::engine::general_purpose::STANDARD.encode(vec![b'x'; 1024 * 1024]);
+    let mut child = sio()
+        .args(["stdio", "--loopback"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = BufReader::new(child.stdout.take().unwrap());
+    let mut next = || {
+        let mut line = String::new();
+        stdout.read_line(&mut line).unwrap();
+        serde_json::from_str::<Value>(&line).unwrap()
+    };
+    stdin
+        .write_all(
+            concat!(
+                "{\"cmd\":\"open\",\"port\":\"loop://\"}\n",
+                "{\"id\":\"wait\",\"cmd\":\"expect\",\"pattern\":\"never\",\"timeout_ms\":30000}\n",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+    assert_eq!(next()["command"], "open");
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    for index in 0..40 {
+        writeln!(
+            stdin,
+            r#"{{"id":"w{index}","cmd":"write","data_b64":"{payload}"}}"#
+        )
+        .unwrap();
+    }
+    stdin
+        .write_all(b"{\"id\":\"c\",\"cmd\":\"cancel\",\"target\":\"wait\"}\n")
+        .unwrap();
+    drop(stdin);
+
+    let waited = next();
+    assert_eq!(waited["id"], "wait");
+    assert_eq!(waited["result"]["end"], "cancelled");
+    let writes: Vec<Value> = (0..40).map(|_| next()).collect();
+    let cancel = next();
+    assert!(child.wait().unwrap().success());
+    assert_eq!(cancel["result"]["cancelled"], true);
+
+    let full: Vec<_> = writes
+        .iter()
+        .filter(|reply| reply["error"]["code"] == "queue_full")
+        .collect();
+    let written = writes.iter().filter(|reply| reply["ok"] == true).count();
+    assert_eq!(
+        full.len() + written,
+        40,
+        "every write gets exactly one reply"
+    );
+    assert!((1..=12).contains(&written), "{written} writes fit 16 MiB");
+    assert!(full.iter().all(|reply| reply["error"]["retryable"] == true));
+    for (index, reply) in writes.iter().enumerate() {
+        assert_eq!(reply["id"], format!("w{index}"), "replies stay in order");
+    }
+}
+
+#[test]
 fn an_oversized_payload_is_rejected_with_its_id() {
     let payload = "A".repeat(1_500_000);
     let line = format!("{{\"id\":\"big\",\"cmd\":\"write\",\"data_b64\":\"{payload}\"}}\n");

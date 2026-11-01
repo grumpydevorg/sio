@@ -4,15 +4,17 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use sio::protocol::{
-    Command, CommandError, End, MAX_LINE_BYTES, OpenParams, Outcome, Payload, ReadSize, Rejected,
-    Request, RequestId, Response, TimeoutMs, parse_request,
+    Command, CommandError, End, ErrorCode, MAX_LINE_BYTES, MAX_QUEUED_BYTES, MAX_QUEUED_REQUESTS,
+    OpenParams, Outcome, Payload, ReadSize, Rejected, Request, RequestId, Response, TimeoutMs,
+    parse_request,
 };
 use sio::server::CommandHandler;
 use sio::transport::{LocalTransport, LoopbackTransport, SerialTransport, list_ports};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -240,7 +242,10 @@ fn finish_transaction(response: &Response, json_output: bool) -> Result<()> {
 
 /// A stdin line on its way from the reader thread to the command thread.
 enum Queued {
-    Line(Result<Request, Rejected>),
+    /// A request and the request-line bytes it holds against
+    /// [`MAX_QUEUED_BYTES`].
+    Request(Request, usize),
+    Rejected(Rejected),
     /// A cancel already applied by the reader; answered in queue order.
     Cancel {
         id: Option<RequestId>,
@@ -251,9 +256,13 @@ enum Queued {
 fn run_stdio(loopback: bool, read_only: bool, fail_fast: bool) -> Result<()> {
     let mut handler = CommandHandler::new(transport(loopback), read_only);
     let gate = handler.cancel_gate();
-    // Unbounded so the reader never blocks behind queued work: a cancel line
-    // must be read while the request before it is still running.
-    let (sender, queue) = mpsc::channel();
+    let queued_bytes = Arc::new(AtomicUsize::new(0));
+    // The reader keeps reading while a request runs, so a cancel line reaches
+    // the running wait. Memory stays bounded: requests over the byte budget
+    // are answered `queue_full` (a few hundred bytes each) instead of queued,
+    // and once MAX_QUEUED_REQUESTS items wait, the reader blocks.
+    let (sender, queue) = mpsc::sync_channel(MAX_QUEUED_REQUESTS);
+    let reader_bytes = Arc::clone(&queued_bytes);
     let reader = thread::spawn(move || -> io::Result<()> {
         let mut reader = BufReader::new(io::stdin().lock());
         let mut line = Vec::with_capacity(4096);
@@ -263,13 +272,13 @@ fn run_stdio(loopback: bool, read_only: bool, fail_fast: bool) -> Result<()> {
                 continue;
             }
             let item = if too_long {
-                Queued::Line(Err(Rejected {
+                Queued::Rejected(Rejected {
                     id: None,
                     command: "parse",
                     error: CommandError::invalid(format!(
                         "request line exceeds {MAX_LINE_BYTES} bytes"
                     )),
-                }))
+                })
             } else {
                 match parse_request(&line) {
                     Ok(Request {
@@ -279,7 +288,8 @@ fn run_stdio(loopback: bool, read_only: bool, fail_fast: bool) -> Result<()> {
                         ticket: gate.request(target.as_ref()),
                         id,
                     },
-                    parsed => Queued::Line(parsed),
+                    Ok(request) => admit(request, line.len(), &reader_bytes),
+                    Err(rejected) => Queued::Rejected(rejected),
                 }
             };
             if sender.send(item).is_err() {
@@ -292,8 +302,12 @@ fn run_stdio(loopback: bool, read_only: bool, fail_fast: bool) -> Result<()> {
     let mut stdout = io::stdout().lock();
     for item in queue {
         let response = match item {
-            Queued::Line(Ok(request)) => handler.execute(request),
-            Queued::Line(Err(rejected)) => handler.reject(rejected),
+            Queued::Request(request, cost) => {
+                let response = handler.execute(request);
+                queued_bytes.fetch_sub(cost, Ordering::AcqRel);
+                response
+            }
+            Queued::Rejected(rejected) => handler.reject(rejected),
             Queued::Cancel { id, ticket } => handler.finish_cancel(id, ticket),
         };
         serde_json::to_writer(&mut stdout, &response)?;
@@ -307,6 +321,31 @@ fn run_stdio(loopback: bool, read_only: bool, fail_fast: bool) -> Result<()> {
         .join()
         .map_err(|_| anyhow::anyhow!("stdin reader panicked"))??;
     Ok(())
+}
+
+/// Queue `request` if its line fits the byte budget, otherwise answer it
+/// `queue_full`. A request always fits an empty queue.
+fn admit(request: Request, cost: usize, queued_bytes: &AtomicUsize) -> Queued {
+    let admitted = queued_bytes
+        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+            (queued == 0 || queued + cost <= MAX_QUEUED_BYTES).then_some(queued + cost)
+        })
+        .is_ok();
+    if admitted {
+        Queued::Request(request, cost)
+    } else {
+        Queued::Rejected(Rejected {
+            command: request.command.name(),
+            id: request.id,
+            error: CommandError::new(
+                ErrorCode::QueueFull,
+                format!(
+                    "more than {MAX_QUEUED_BYTES} bytes of requests are queued; nothing was done, resend after earlier replies arrive"
+                ),
+                true,
+            ),
+        })
+    }
 }
 
 /// Read one line into `output`, keeping at most `MAX_LINE_BYTES + 1` bytes.

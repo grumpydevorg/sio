@@ -93,7 +93,7 @@ without `id`.
 `command`, `ok`, and either `result` or `error` (`code`, `message`,
 `retryable`). Error codes: `invalid_request`, `read_only`, `not_open`,
 `already_open`, `port_not_found`, `ambiguous_port`, `port_busy`,
-`permission_denied`, `disconnected`, `transport`.
+`permission_denied`, `disconnected`, `transport`, `queue_full`.
 
 **Received data.** `read`, `readline`, `expect`, and `drain` return
 `data_b64`, `text` (only when the bytes are valid UTF-8), `bytes`,
@@ -135,7 +135,12 @@ short waits (2–5 s) in a loop over one long wait. To stop a running `read`,
   requests sent before it.
 
 Limits: request line 8 MiB; payload, read, and expect window 1 MiB; timeouts
-1–60000 ms; break 1–10000 ms.
+1–60000 ms; break 1–10000 ms. Behind a running request, sio queues at most
+16 MiB of request lines; a request beyond that is answered at once with
+`queue_full` (`retryable: true`, nothing was done) in its place in the reply
+order. With 1024 requests already queued, sio stops reading stdin until the
+queue drains, so a `cancel` sent then waits too. Send the next request after
+the previous reply instead of flooding.
 
 ## Keep a session alive with tendr
 

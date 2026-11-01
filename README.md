@@ -88,7 +88,9 @@ stdin NDJSON → protocol (parse + validate) → server::CommandHandler → tran
   up can be lost; `serialport` reports the hang-up before them.
 - `sio stdio` reads stdin on its own thread so a `cancel` can reach a running
   wait; requests still run one at a time, in order, and replies come in that
-  order. Waits poll in 100 ms slices.
+  order. Waits poll in 100 ms slices. The queue behind a running request is
+  bounded: over 16 MiB of request lines, a request is answered `queue_full`
+  instead of queued; at 1024 queued items stdin is not read until it drains.
 
 ## Build and check
 
