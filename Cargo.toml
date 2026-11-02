@@ -14,6 +14,7 @@ categories = ["command-line-utilities", "hardware-support"]
 # the library and the installed command are both `sio`.
 include = [
     "/src/**/*.rs",
+    "/tests/**/*.rs",
     "/skills/sio/SKILL.md",
     "/README.md",
     "/CHANGELOG.md",
