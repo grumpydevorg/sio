@@ -1,13 +1,34 @@
 [package]
-name = "sio"
+name = "sio-serial"
 version = "0.4.0"
 edition = "2024"
 rust-version = "1.98.0"
-description = "Safe, agent-friendly serial I/O for terminals and automation"
+description = "Safe, agent-friendly serial I/O: an interactive terminal and an NDJSON session protocol for automation"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/grumpydevorg/sio"
+readme = "README.md"
 authors = ["Supersensory Technologies <dev@supersensory.ai>"]
-publish = false
+keywords = ["serial", "uart", "tty", "cli", "agent"]
+categories = ["command-line-utilities", "hardware-support"]
+# The crate is published as sio-serial because `sio` is taken on crates.io;
+# the library and the installed command are both `sio`.
+include = [
+    "/src/**/*.rs",
+    "/skills/sio/SKILL.md",
+    "/README.md",
+    "/CHANGELOG.md",
+    "/LICENSE-APACHE",
+    "/LICENSE-MIT",
+]
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/sio-{ target }{ archive-suffix }"
+pkg-fmt = "tgz"
+bin-dir = "{ bin }{ binary-ext }"
+
+[lib]
+name = "sio"
+path = "src/lib.rs"
 
 [[bin]]
 name = "sio"

@@ -222,9 +222,22 @@ impl SerialTransport for LocalTransport {
     }
 }
 
+fn is_listed(path: &str) -> bool {
+    serialport::available_ports().is_ok_and(|ports| {
+        ports
+            .iter()
+            .any(|port| port.port_name.eq_ignore_ascii_case(path))
+    })
+}
+
 fn open_failure(path: &str, error: serialport::Error) -> TransportError {
     let path = path.to_owned();
     match error.kind() {
+        // Windows reports a missing port, a busy port and access denied all
+        // as NoDevice; a port the system does not list is the missing one.
+        serialport::ErrorKind::NoDevice if cfg!(windows) && !is_listed(&path) => {
+            TransportError::PortNotFound { path }
+        }
         serialport::ErrorKind::NoDevice => TransportError::PortBusy { path },
         serialport::ErrorKind::Io(ErrorKind::NotFound) => TransportError::PortNotFound { path },
         serialport::ErrorKind::Io(ErrorKind::PermissionDenied) => {

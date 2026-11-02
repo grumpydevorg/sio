@@ -5,6 +5,20 @@ human terminal traffic separate from machine-readable output, preserves binary
 data, validates commands before touching hardware, and has no network listener.
 Run it on the machine with the port, over SSH or `tendr --host`.
 
+## Install
+
+```console
+$ cargo binstall sio-serial        # prebuilt binary from the GitHub release
+$ cargo install sio-serial         # build from crates.io
+$ nix run github:grumpydevorg/sio -- --version
+```
+
+The crate is `sio-serial` because `sio` was taken on crates.io; the installed
+command is `sio`. Release archives (`sio-<target>.tar.gz`) cover Linux
+(glibc), macOS and Windows on x86-64 and ARM64, each with a SHA-256 file and a
+build attestation: `gh attestation verify <archive> --repo grumpydevorg/sio`.
+Building on Linux needs `libudev` and `pkg-config`.
+
 ## Quick start
 
 ```console
@@ -40,9 +54,9 @@ is in the embedded skill.
 ## With tendr
 
 [tendr](https://github.com/grumpydevorg/tendr) keeps `sio stdio` running
-between an agent's tool calls, locally or with `--host`. A tendr with the
-`ndjson` exec target (releases after 0.4.1; `tendr guide ndjson`) sends one
-request per `tendr exec`
+between an agent's tool calls, locally or with `--host`. With tendr 0.5.0 or
+newer, the `ndjson` exec target (`tendr guide ndjson`) sends one request per
+`tendr exec`
 and returns the reply that carries the request's id, so a reply that arrives
 after a client timeout is never mistaken for the next request's reply:
 
@@ -106,7 +120,8 @@ $ nix flake check
 ```
 
 The toolchain is pinned in `rust-toolchain.toml` and matches `rust-version`.
-The crate, executable, package, and project are all named `sio`.
+The crate is `sio-serial`; the library, executable and project are `sio`.
+Changes are listed in `CHANGELOG.md`.
 
 ## Safety model
 

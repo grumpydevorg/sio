@@ -152,7 +152,7 @@ the previous reply instead of flooding.
 A shell tool call ends its processes, so a plain `sio stdio` dies between
 calls. Run it under tendr instead.
 
-With a tendr that has the `ndjson` exec target (releases after 0.4.1; check
+With tendr 0.5.0 or newer, which has the `ndjson` exec target (check
 with `tendr guide ndjson`), `exec` sends one request and returns the reply
 carrying its own id; replies to an earlier timed-out exec appear in
 `unmatched`, never as your reply:
@@ -171,9 +171,9 @@ waiting. Give `tendr exec --timeout` more than the request's `timeout_ms`, or
 better, keep `timeout_ms` short and loop. If an exec does time out, its request
 may still be running: stop it with
 `tendr exec serial -- '{"cmd":"cancel","target":"<request_id>"}'`, using the
-`request_id` tendr reports for the timed-out exec (also tendr releases after
-0.4.1). The stopped request's reply then appears in that exec's `unmatched`.
-Without the ndjson target (tendr 0.4.1 and earlier), use
+`request_id` tendr reports for the timed-out exec (tendr 0.5.0 or newer). The
+stopped request's reply then appears in that exec's `unmatched`.
+With an older tendr, which lacks the ndjson target, use
 `printf '%s\n' '{"id":"r1",…}' | tendr push
 serial` and find the response with `"id":"r1"` in `tendr log serial`. For a
 human console that an agent can also drive, use
