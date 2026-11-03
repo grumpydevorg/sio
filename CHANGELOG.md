@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+### Docs
+
+- The README and embedded skill give port names for Linux, macOS and
+  Windows, say what `permission_denied` usually means on Linux, and
+  describe watching a `sio terminal` console with
+  `tendr attach --read-only` (tendr 0.7.0 or newer).
+- The README has a Status section that says what has been tested and what
+  has not.
+
 ## v0.4.0 — first public release (2026-11-02)
 
 The crate is published as `sio-serial`; the command is `sio`. Licensed MIT

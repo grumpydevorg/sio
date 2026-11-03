@@ -1,9 +1,10 @@
 # sio
 
-`sio` is a small serial terminal and an automation-safe NDJSON tool. It keeps
-human terminal traffic separate from machine-readable output, preserves binary
-data, validates commands before touching hardware, and has no network listener.
-Run it on the machine with the port, over SSH or `tendr --host`.
+`sio` is a serial terminal for people and an NDJSON session protocol for
+agents and scripts. It keeps terminal traffic apart from machine-readable
+output, preserves binary data, validates every request before touching
+hardware, and opens no network socket: run it on the machine with the port,
+directly, over SSH or with `tendr --host`.
 
 ## Install
 
@@ -13,10 +14,11 @@ $ cargo install sio-serial         # build from crates.io
 $ nix run github:grumpydevorg/sio -- --version
 ```
 
-The crate is `sio-serial` because `sio` was taken on crates.io; the installed
-command is `sio`. Release archives (`sio-<target>.tar.gz`) cover Linux
-(glibc), macOS and Windows on x86-64 and ARM64, each with a SHA-256 file and a
-build attestation: `gh attestation verify <archive> --repo grumpydevorg/sio`.
+The crate is `sio-serial` because `sio` was taken on crates.io; the command
+and library are `sio`. Each [release](https://github.com/grumpydevorg/sio/releases)
+has `sio-<target>.tar.gz` archives for Linux (glibc 2.35 or newer), macOS and
+Windows on x86-64 and ARM64, each with a SHA-256 file and a build
+attestation: `gh attestation verify <archive> --repo grumpydevorg/sio`.
 Building on Linux needs `libudev` and `pkg-config`.
 
 ## Quick start
@@ -24,15 +26,14 @@ Building on Linux needs `libudev` and `pkg-config`.
 ```console
 $ sio list
 $ sio terminal --serial BH00T16X --baud 115200
-$ sio transact --port /dev/cu.usbserial-BH00T16X --text 'AT\r' --expect OK
+$ sio transact --port /dev/ttyUSB0 --text 'AT\r' --expect OK
 ```
 
-Interactive terminal mode forwards keyboard input to the device. Press
-`Ctrl+]` to exit; `Ctrl+C` is sent to the serial peer. `--crlf` displays bare
-LF from the device as CR LF.
+`sio terminal` sends keyboard input to the device. `Ctrl+]` exits; `Ctrl+C`
+goes to the device. `--crlf` shows bare LF from the device as CR LF.
 
-For an agent or script, keep one `sio stdio` process alive so that its open
-serial session survives across commands:
+For an agent or script, keep one `sio stdio` process alive so its open port
+survives across requests:
 
 ```console
 $ printf '%s\n' \
@@ -42,23 +43,32 @@ $ printf '%s\n' \
   '{"id":4,"cmd":"close"}' | sio stdio --loopback
 ```
 
-Every stdout line is one response object and echoes the request's `id`.
-Diagnostics go to stderr. Received bytes are always returned as Base64 in
-`data_b64`; valid UTF-8 is also included as `text`. Bytes received but not yet
-returned stay buffered for the next read, so nothing is dropped between
-commands; an `expect` or `readline` that times out leaves its bytes buffered,
-so short waits in a loop are safe. `{"cmd":"cancel","target":"<id>"}` stops a
-running wait within about 100 ms, ahead of queued requests. The full protocol
-is in the embedded skill.
+Each stdout line is one response and echoes its request's `id`; diagnostics
+go to stderr. Received bytes come back as Base64 in `data_b64`, plus `text`
+when they are valid UTF-8. Bytes not yet returned stay buffered for the next
+read, and an `expect` or `readline` that times out keeps its bytes, so short
+waits in a loop lose nothing. `{"cmd":"cancel","target":"<id>"}` stops a
+running wait within about 100 ms. The full protocol is in the
+[embedded skill](skills/sio/SKILL.md).
+
+## Ports on each platform
+
+| Platform | Port names | Notes |
+|---|---|---|
+| Linux | `/dev/ttyUSB0`, `/dev/ttyACM0` | Without access to the device (usually the `dialout` or `uucp` group) `open` fails with `permission_denied`. |
+| macOS | `/dev/cu.usbserial-…` | Each adapter also appears as `/dev/tty.…`, which can block on open; `sio list` shows only the `cu.` name. |
+| Windows | `COM3` | A busy port and a missing port are told apart by whether Windows lists it. |
+
+`--serial <number>` (or `"serial"` in `open`) selects an adapter by its USB
+serial number on every platform and needs exactly one match.
 
 ## With tendr
 
-[tendr](https://github.com/grumpydevorg/tendr) keeps `sio stdio` running
-between an agent's tool calls, locally or with `--host`. With tendr 0.5.0 or
-newer, the `ndjson` exec target (`tendr guide ndjson`) sends one request per
-`tendr exec`
-and returns the reply that carries the request's id, so a reply that arrives
-after a client timeout is never mistaken for the next request's reply:
+A shell tool call ends its processes, so an agent runs `sio stdio` under
+[tendr](https://github.com/grumpydevorg/tendr), locally or with `--host`. With
+tendr 0.5.0 or newer, the `ndjson` exec target sends one request per
+`tendr exec` and returns the reply carrying that request's id, so a late reply
+to a timed-out request is never taken for the next one:
 
 ```console
 $ tendr start --stdin --exec-target ndjson serial -- sio stdio --read-only
@@ -66,23 +76,45 @@ $ tendr exec serial -- '{"cmd":"open","serial":"BH00T16X"}'
 $ tendr exec serial -- '{"cmd":"readline","timeout_ms":5000}'
 ```
 
-`tendr start --pty con -- sio terminal …` gives a console that a person can
-`tendr attach` to while tendr keeps a timestamped capture.
+`tendr start --pty con -- sio terminal …` runs a console that a person can
+`tendr attach` to while tendr keeps a timestamped log. With tendr 0.7.0 or
+newer, `tendr attach --read-only con` watches it without taking control.
 
-## Self-documenting agent skill
+## Safety model
 
-The canonical agent skill is embedded in the binary:
+- Opening a port can toggle modem lines and reset attached boards. DTR
+  defaults to `preserve`, but an operating system or USB adapter may still
+  pulse it.
+- `sio stdio --read-only` rejects writes, breaks and modem-line changes.
+- Mutating results report their side effect and whether a retry is safe.
+- Reads consume the serial stream. A timeout is an ordinary result, not
+  permission to retry a write.
+- Request lines, payloads, reads, timeouts, break durations and the expect
+  window all have explicit limits.
+
+## Status
+
+CI builds and tests every change on Linux, macOS and Windows. The tests drive
+an in-memory loopback device; a Linux pseudo-terminal has also been used by
+hand. sio has not yet been tested with a physical USB serial adapter, so
+opening real hardware, unplug handling and busy-port detection are unproven
+on every platform. Bytes the operating system still held when a device hung
+up can be lost, because `serialport` reports the hang-up first. There is no
+option for RTS/CTS flow control yet. Changes are listed in `CHANGELOG.md`.
+
+## Agent skill
+
+The agent skill is embedded in the binary:
 
 ```console
 $ sio skill                         # print it
-$ sio skill --output ./SKILL.md     # write it without clobbering
+$ sio skill --output ./SKILL.md     # write it; refuses to replace a different file
 $ sio skill --output ./SKILL.md --force
-$ sio skill --check ./SKILL.md      # detect version drift
+$ sio skill --check ./SKILL.md      # exit nonzero if the file and binary differ
 ```
 
-`sio skills` is an alias for `sio skill`. The checked-in
-`skills/sio/SKILL.md` is the source embedded at compile time and tested for an
-exact round trip.
+`sio skills` is an alias. `skills/sio/SKILL.md` is compiled into the binary
+and a test checks the round trip exactly.
 
 ## Design
 
@@ -92,20 +124,18 @@ stdin NDJSON → protocol (parse + validate) → server::CommandHandler → tran
                                                                       └ LoopbackTransport (echo)
 ```
 
-- Requests are validated while they are parsed: baud, data and stop bits,
-  sizes and timeouts are range-checked types, so an invalid request never
-  reaches a transport.
-- Responses are typed; `end`, `side_effect` and error `code` values are enums.
-- `LocalTransport` classifies failures: a missing path is `port_not_found`, a
-  locked port `port_busy`, and a vanished device closes the port and reports
-  `disconnected`. Bytes the operating system still held when the device hung
-  up can be lost; `serialport` reports the hang-up before them.
+- Requests are validated while they are parsed: baud, framing, sizes and
+  timeouts are range-checked types, so an invalid request never reaches a
+  transport. Responses are typed; `end`, `side_effect` and error `code` are
+  enums.
+- `LocalTransport` classifies failures as `port_not_found`, `port_busy`,
+  `permission_denied` or `disconnected`; a vanished device closes the port.
 - `sio stdio` reads stdin on its own thread so a `cancel` can reach a running
-  wait; requests still run one at a time, in order, and replies come in that
-  order, except that a `cancel` which stops nothing is answered immediately.
-  Waits poll in 100 ms slices. The queue behind a running request is
-  bounded: over 16 MiB of request lines, a request is answered `queue_full`
-  instead of queued; at 1024 queued items stdin is not read until it drains.
+  wait. Requests run one at a time and reply in order, except that a `cancel`
+  which stops nothing replies at once. Waits poll in 100 ms slices.
+- The queue behind a running request is bounded: past 16 MiB of request
+  lines a request is answered `queue_full`, and at 1024 queued requests stdin
+  is not read until the queue drains.
 
 ## Build and check
 
@@ -120,20 +150,9 @@ $ nix flake check
 ```
 
 The toolchain is pinned in `rust-toolchain.toml` and matches `rust-version`.
-The crate is `sio-serial`; the library, executable and project are `sio`.
-Changes are listed in `CHANGELOG.md`.
-
-## Safety model
-
-- Opening a serial port can toggle modem lines or reset attached boards. DTR
-  defaults to `preserve`; operating systems and USB adapters may still pulse it.
-- Mutating commands report their side effect and whether retrying is safe.
-- `sio stdio --read-only` rejects writes, breaks, and modem-line changes.
-- Request lines, reads, timeouts, break durations, and the expect window have
-  explicit limits.
-- Reads consume bytes from the serial stream. A timeout is an ordinary result,
-  not permission to retry a write.
-- No command binds a TCP or HTTP socket.
+Pushing a `v*` tag runs `.github/workflows/release.yml`; run `cargo publish`
+only after its `publish` job is green, because `cargo binstall` fetches from
+the GitHub release.
 
 ## License
 

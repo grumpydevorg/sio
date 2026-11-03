@@ -1,6 +1,6 @@
 ---
 name: sio
-description: Use sio to list serial ports, identify USB UARTs, open UART or serial consoles, send and receive binary-safe data, automate AT commands, and diagnose ttyUSB, ttyACM, or cu.usbserial devices. Use when a user mentions a serial port, UART, serial console, modem, GPS serial stream, AT command, or serial adapter.
+description: Use sio to list serial ports, identify USB UARTs, open UART or serial consoles, send and receive binary-safe data, automate AT commands, and diagnose ttyUSB, ttyACM, cu.usbserial or COM-port devices. Use when a user mentions a serial port, UART, serial console, modem, GPS serial stream, AT command, or serial adapter.
 ---
 
 # sio — serial I/O
@@ -29,8 +29,12 @@ sio list
 sio list --json
 ```
 
-On macOS, prefer `/dev/cu.*`. When the adapter has a USB serial number, use
-`--serial SERIAL` instead of a path; `sio` requires exactly one match.
+Port names: `/dev/ttyUSB0` or `/dev/ttyACM0` on Linux, `/dev/cu.usbserial-…`
+on macOS (not the `/dev/tty.*` twin, which can block on open; `sio list`
+shows only `cu.`), `COM3` on Windows. When the adapter has a USB serial
+number, use `--serial SERIAL` instead of a path; `sio` requires exactly one
+match. `permission_denied` on Linux usually means the user is not in the
+device's group (`dialout` or `uucp`).
 
 ## Interactive console
 
@@ -152,10 +156,10 @@ the previous reply instead of flooding.
 A shell tool call ends its processes, so a plain `sio stdio` dies between
 calls. Run it under tendr instead.
 
-With tendr 0.5.0 or newer, which has the `ndjson` exec target (check
-with `tendr guide ndjson`), `exec` sends one request and returns the reply
-carrying its own id; replies to an earlier timed-out exec appear in
-`unmatched`, never as your reply:
+With tendr 0.5.0 or newer (check with `tendr --version`; upgrade with
+`cargo binstall tendr`), the `ndjson` exec target makes `exec` send one
+request and return the reply carrying its own id; replies to an earlier
+timed-out exec appear in `unmatched`, never as your reply:
 
 ```bash
 tendr start --stdin --exec-target ndjson serial -- sio stdio --read-only
@@ -171,14 +175,15 @@ waiting. Give `tendr exec --timeout` more than the request's `timeout_ms`, or
 better, keep `timeout_ms` short and loop. If an exec does time out, its request
 may still be running: stop it with
 `tendr exec serial -- '{"cmd":"cancel","target":"<request_id>"}'`, using the
-`request_id` tendr reports for the timed-out exec (tendr 0.5.0 or newer). The
-stopped request's reply then appears in that exec's `unmatched`.
-With an older tendr, which lacks the ndjson target, use
-`printf '%s\n' '{"id":"r1",…}' | tendr push
-serial` and find the response with `"id":"r1"` in `tendr log serial`. For a
-human console that an agent can also drive, use
+`request_id` tendr reports for the timed-out exec. The stopped request's reply
+then appears in that exec's `unmatched`.
+
+For a human console that an agent can also drive, use
 `tendr start --pty con -- sio terminal …` with `tendr attach con` and
-`tendr push con`; tendr's log keeps a timestamped capture.
+`tendr push con`; tendr's log keeps a timestamped capture. With tendr 0.7.0
+or newer, `tendr attach --read-only con` watches it without taking control;
+piped, it streams the raw output to stdout and exits 0 only once it has all
+of it (84 when cut off short).
 
 ## Reproduce this skill from the binary
 
