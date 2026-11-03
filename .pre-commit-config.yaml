@@ -1,0 +1,51 @@
+# Git hooks, run by prek. Once per clone: `prek install`. Commit runs the fast
+# checks; push runs the tests and the supply-chain check, the gates CI runs.
+# Every tool is the toolchain rust-toolchain.toml pins, so a hook and CI agree.
+default_install_hook_types: [pre-commit, pre-push]
+repos:
+  - repo: builtin
+    hooks:
+      - id: check-added-large-files
+        stages: [pre-commit]
+      - id: check-merge-conflict
+        stages: [pre-commit]
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        language: system
+        entry: cargo fmt --all --check
+        types: [rust]
+        pass_filenames: false
+        stages: [pre-commit]
+      - id: cargo-clippy
+        name: cargo clippy (pedantic via [lints])
+        language: system
+        entry: cargo clippy --locked --all-targets --all-features -- -D warnings
+        files: (\.rs|Cargo\.(toml|lock))$
+        pass_filenames: false
+        stages: [pre-commit]
+      # The skill is compiled into the binary; the copy on disk must match it.
+      - id: skill-round-trip
+        name: embedded skill matches skills/sio/SKILL.md
+        language: system
+        entry: cargo run --locked --quiet -- skill --check skills/sio/SKILL.md
+        files: ^(skills/sio/SKILL\.md|src/.*\.rs)$
+        pass_filenames: false
+        stages: [pre-commit]
+      # Always on push: a commit that only deletes files reaches no `files:`
+      # filter, and the tests are what CI would otherwise be first to run.
+      - id: cargo-test
+        name: cargo test
+        language: system
+        entry: cargo test --locked --all-targets --no-fail-fast
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]
+      - id: cargo-deny
+        name: cargo deny
+        language: system
+        entry: cargo deny check
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

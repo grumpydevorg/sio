@@ -150,6 +150,10 @@ $ nix flake check
 ```
 
 The toolchain is pinned in `rust-toolchain.toml` and matches `rust-version`.
+`prek install` once per clone: commits run format, clippy and the skill
+round trip; pushes run the tests and `cargo deny`. After a tendr release,
+`scripts/tendr-compat.sh [path/to/tendr]` checks that it still drives sio as
+documented, on the loopback device.
 Pushing a `v*` tag runs `.github/workflows/release.yml`; run `cargo publish`
 only after its `publish` job is green, because `cargo binstall` fetches from
 the GitHub release.
