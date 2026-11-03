@@ -1,4 +1,6 @@
-# Build sio from a positively selected source set.
+# Build sio from a positively selected source set. The package also installs
+# the agent skill the binary embeds at share/agent-skills/sio/SKILL.md, so a
+# consumer can link agents' skill directories at it.
 {
   lib,
   pkg-config,
@@ -39,14 +41,19 @@ rustPlatform.buildRustPackage {
   installCheckPhase = ''
     runHook preInstallCheck
     "$out/bin/sio" --version | grep -Fx 'sio ${cargoToml.package.version}'
-    "$out/bin/sio" skill --check ${./skills/sio/SKILL.md}
+    "$out/bin/sio" skill --check "$out/share/agent-skills/sio/SKILL.md"
     "$out/bin/sio" transact --loopback --port loop:// --text test --expect test --json \
       | grep -F '"matched":true'
     runHook postInstallCheck
   '';
 
+  postInstall = ''
+    install -Dm644 skills/sio/SKILL.md "$out/share/agent-skills/sio/SKILL.md"
+  '';
+
   meta = {
     inherit (cargoToml.package) description;
+    homepage = cargoToml.package.repository;
     mainProgram = "sio";
     license = with lib.licenses; [
       mit
