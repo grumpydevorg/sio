@@ -141,7 +141,7 @@ fn stdio_keeps_one_session_and_one_json_response_per_command() {
         ),
     );
     assert!(status.success());
-    assert!(stderr.is_empty());
+    assert_eq!(stderr, Vec::<u8>::new());
     assert_eq!(responses.len(), 4);
     let session = &responses[0]["session_id"];
     assert!(
