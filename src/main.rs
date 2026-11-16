@@ -338,7 +338,7 @@ fn write_response(response: &Response) -> io::Result<()> {
 /// `queue_full`. A request always fits an empty queue.
 fn admit(request: Request, cost: usize, queued_bytes: &AtomicUsize) -> Queued {
     let admitted = queued_bytes
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
             (queued == 0 || queued + cost <= MAX_QUEUED_BYTES).then_some(queued + cost)
         })
         .is_ok();
